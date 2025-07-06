@@ -4,6 +4,7 @@ v86 emulates an x86-compatible CPU and hardware. Machine code is translated to
 WebAssembly modules at runtime in order to achieve decent performance. Here's a
 list of emulated hardware:
 
+- Forked system images at ```https://github.com/alex-images/v86-images```
 - An x86-compatible CPU. The instruction set is around Pentium 4 level,
   including full SSE3 support. Some features are missing, in particular:
   - Task gates, far calls in protected mode
