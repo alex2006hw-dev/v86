@@ -86,8 +86,7 @@ v86.prototype.destroy = function()
 
 v86.prototype.restart = function()
 {
-    this.cpu.reset_cpu();
-    this.cpu.load_bios();
+    this.cpu.reboot_internal();
 };
 
 v86.prototype.init = function(settings)
@@ -109,6 +108,17 @@ if(typeof process !== "undefined")
         {
             setTimeout(tick => this.yield_callback(tick), t, tick);
         }
+    };
+
+    v86.prototype.register_yield = function() {};
+    v86.prototype.unregister_yield = function() {};
+}
+else if(globalThis["scheduler"] && typeof globalThis["scheduler"]["postTask"] === "function" && location.href.includes("use-scheduling-api"))
+{
+    v86.prototype.yield = function(t, tick)
+    {
+        t = Math.max(0, t);
+        globalThis["scheduler"]["postTask"](() => this.yield_callback(tick), { delay: t });
     };
 
     v86.prototype.register_yield = function() {};

@@ -36,7 +36,8 @@ export function WispNetworkAdapter(wisp_url, bus, config)
     this.dns_method = config.dns_method || "doh";
     this.doh_server = config.doh_server;
     this.tcp_conn = {};
-    this.eth_encoder_buf = create_eth_encoder_buf();
+    this.mtu = config.mtu;
+    this.eth_encoder_buf = create_eth_encoder_buf(this.mtu);
 
     this.bus.register("net" + this.id + "-mac", function(mac) {
         this.vm_mac = new Uint8Array(mac.split(":").map(function(x) { return parseInt(x, 16); }));
@@ -93,10 +94,12 @@ WispNetworkAdapter.prototype.process_incoming_wisp_frame = function(frame) {
             }
 
             if(this.connections[stream_id].congested) {
-                for(const packet of this.congested_buffer) {
+                const buffer = this.congested_buffer.slice(0);
+                this.congested_buffer.length = 0;
+                this.connections[stream_id].congested = false;
+                for(const packet of buffer) {
                     this.send_packet(packet.data, packet.type, stream_id);
                 }
-                this.connections[stream_id].congested = false;
             }
             break;
         case 4: // CLOSE
@@ -185,17 +188,12 @@ WispNetworkAdapter.prototype.destroy = function()
 };
 
 /**
+ * @param {TCPConnection} conn
  * @param {Uint8Array} packet
- * @param {String} tuple
  */
-WispNetworkAdapter.prototype.on_tcp_connection = function(packet, tuple)
+WispNetworkAdapter.prototype.on_tcp_connection = function(conn, packet)
 {
-    let conn = new TCPConnection();
-    conn.state = TCP_STATE_SYN_RECEIVED;
-    conn.net = this;
-    conn.tuple = tuple;
     conn.stream_id = this.last_stream++;
-    this.tcp_conn[tuple] = conn;
 
     conn.on("data", data => {
         if(data.length !== 0) {
@@ -222,7 +220,7 @@ WispNetworkAdapter.prototype.on_tcp_connection = function(packet, tuple)
         type: "CONNECT",
         stream_id: conn.stream_id,
         hostname: packet.ipv4.dest.join("."),
-        port: packet.tcp.dport,
+        port: conn.sport,
         data_callback: (data) => {
             conn.write(data);
         },
@@ -231,7 +229,7 @@ WispNetworkAdapter.prototype.on_tcp_connection = function(packet, tuple)
         }
     });
 
-    conn.accept(packet);
+    conn.accept();
     return true;
 };
 

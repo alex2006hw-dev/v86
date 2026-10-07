@@ -15,8 +15,10 @@ import { KeyboardAdapter } from "./keyboard.js";
 import { MouseAdapter } from "./mouse.js";
 import { ScreenAdapter } from "./screen.js";
 import { DummyScreenAdapter } from "./dummy_screen.js";
-import { SerialAdapter, SerialAdapterXtermJS } from "./serial.js";
+import { ANSIScreenAdapter } from "./ansi_screen.js";
+import { SerialAdapter, VirtioConsoleAdapter, SerialAdapterXtermJS, VirtioConsoleAdapterXtermJS } from "./serial.js";
 import { InBrowserNetworkAdapter } from "./inbrowser_network.js";
+import { Modem } from "./modem.js";
 
 import { MemoryFileStorage, ServerFileStorageWrapper } from "./filestorage.js";
 import { SyncBuffer, buffer_from_object } from "../buffer.js";
@@ -67,7 +69,6 @@ export function V86(options)
         "abort": function() { dbg_assert(false); },
         "microtick": v86.microtick,
         "get_rand_int": function() { return get_rand_int(); },
-        "apic_acknowledge_irq": function() { return cpu.devices.apic.acknowledge_irq(); },
         "stop_idling": function() { return cpu.stop_idling(); },
 
         "io_port_read8": function(addr) { return cpu.io.port_read8(addr); },
@@ -78,7 +79,6 @@ export function V86(options)
         "io_port_write32": function(addr, value) { cpu.io.port_write32(addr, value); },
 
         "mmap_read8": function(addr) { return cpu.mmap_read8(addr); },
-        "mmap_read16": function(addr) { return cpu.mmap_read16(addr); },
         "mmap_read32": function(addr) { return cpu.mmap_read32(addr); },
         "mmap_write8": function(addr, value) { cpu.mmap_write8(addr, value); },
         "mmap_write16": function(addr, value) { cpu.mmap_write16(addr, value); },
@@ -205,18 +205,27 @@ V86.prototype.continue_init = async function(emulator, options)
 
     var settings = {};
 
-    this.disk_images = {
-        fda: undefined,
-        fdb: undefined,
-        hda: undefined,
-        hdb: undefined,
-        cdrom: undefined,
-    };
-
     const boot_order =
         options.boot_order ? options.boot_order :
         options.fda ? BOOT_ORDER_FD_FIRST :
         options.hda ? BOOT_ORDER_HD_FIRST : BOOT_ORDER_CD_FIRST;
+
+    if(options.modem)
+    {
+        settings.modem = options.modem;
+        switch(options.modem.uart)
+        {
+            case 1:
+                options.uart1 = true;
+                break;
+            case 2:
+                options.uart2 = true;
+                break;
+            case 3:
+                options.uart3 = true;
+                break;
+        }
+    }
 
     settings.acpi = options.acpi;
     settings.disable_jit = options.disable_jit;
@@ -225,18 +234,19 @@ V86.prototype.continue_init = async function(emulator, options)
     settings.vga_memory_size = options.vga_memory_size || 8 * 1024 * 1024;
     settings.boot_order = boot_order;
     settings.fastboot = options.fastboot || false;
+    settings.bootmenu = options.bootmenu || false;
     settings.fda = undefined;
     settings.fdb = undefined;
     settings.uart1 = options.uart1;
     settings.uart2 = options.uart2;
     settings.uart3 = options.uart3;
+    settings.parallel1 = options.parallel1;
     settings.cmdline = options.cmdline;
     settings.preserve_mac_from_state_image = options.preserve_mac_from_state_image;
     settings.mac_address_translation = options.mac_address_translation;
     settings.cpuid_level = options.cpuid_level;
     settings.virtio_balloon = options.virtio_balloon;
-    settings.virtio_console = options.virtio_console;
-    settings.screen_options = options.screen_options;
+    settings.virtio_console = !!options.virtio_console;
 
     const relay_url = options.network_relay_url || options.net_device && options.net_device.relay_url;
     if(relay_url)
@@ -280,26 +290,75 @@ V86.prototype.continue_init = async function(emulator, options)
         this.mouse_adapter = new MouseAdapter(this.bus, screen_options.container);
     }
 
+    // Pointer lock is not needed while the guest uses absolute pointer
+    // positions (the guest cursor follows the host cursor), so release it
+    // when the guest driver enables absolute positioning
+    this.absolute_pointer_enabled = false;
+    this.bus.register("vmware-absolute-mouse", function(enabled)
+    {
+        if(enabled && !this.absolute_pointer_enabled &&
+            typeof document !== "undefined" && document.pointerLockElement)
+        {
+            document.exitPointerLock();
+        }
+        this.absolute_pointer_enabled = enabled;
+    }, this);
+
     if(screen_options.container)
     {
         this.screen_adapter = new ScreenAdapter(screen_options, () => this.v86.cpu.devices.vga && this.v86.cpu.devices.vga.screen_fill_buffer());
     }
+    else if(screen_options.ansi)
+    {
+        this.screen_adapter = new ANSIScreenAdapter(screen_options);
+    }
     else
     {
-        this.screen_adapter = new DummyScreenAdapter();
+        this.screen_adapter = new DummyScreenAdapter(screen_options);
     }
     settings.screen = this.screen_adapter;
     settings.screen_options = screen_options;
 
-    if(options.serial_container)
+    settings.serial_console = options.serial_console || { type: "none" };
+
+    // NOTE: serial_container_xtermjs and serial_container are deprecated
+    if(options.serial_container_xtermjs)
     {
-        this.serial_adapter = new SerialAdapter(options.serial_container, this.bus);
+        settings.serial_console.type = "xtermjs";
+        settings.serial_console.container = options.serial_container_xtermjs;
+    }
+    else if(options.serial_container)
+    {
+        settings.serial_console.type = "textarea";
+        settings.serial_console.container = options.serial_container;
+    }
+
+    if(settings.serial_console?.type === "xtermjs")
+    {
+        const xterm_lib = settings.serial_console.xterm_lib || window["Terminal"];
+        this.serial_adapter = new SerialAdapterXtermJS(settings.serial_console.container, this.bus, xterm_lib);
+    }
+    else if(settings.serial_console?.type === "textarea")
+    {
+        this.serial_adapter = new SerialAdapter(settings.serial_console.container, this.bus);
         //this.recording_adapter = new SerialRecordingAdapter(this.bus);
     }
 
-    if(options.serial_container_xtermjs)
+    const virtio_console_settings = (options.virtio_console && typeof options.virtio_console === "boolean") ? { type: "none" } : options.virtio_console;
+
+    if(virtio_console_settings?.type === "xtermjs")
     {
-        this.serial_adapter = new SerialAdapterXtermJS(options.serial_container_xtermjs, this.bus);
+        const xterm_lib = virtio_console_settings.xterm_lib || window["Terminal"];
+        this.virtio_console_adapter = new VirtioConsoleAdapterXtermJS(virtio_console_settings.container, this.bus, xterm_lib);
+    }
+    else if(virtio_console_settings?.type === "textarea")
+    {
+        this.virtio_console_adapter = new VirtioConsoleAdapter(virtio_console_settings.container, this.bus);
+    }
+
+    if(settings.modem)
+    {
+        this.modem = new Modem(this.bus, settings.modem);
     }
 
     if(!options.disable_speaker)
@@ -313,29 +372,29 @@ V86.prototype.continue_init = async function(emulator, options)
         switch(name)
         {
             case "hda":
-                settings.hda = this.disk_images.hda = buffer;
+                settings.hda = buffer;
                 break;
             case "hdb":
-                settings.hdb = this.disk_images.hdb = buffer;
+                settings.hdb = buffer;
                 break;
             case "cdrom":
-                settings.cdrom = this.disk_images.cdrom = buffer;
+                settings.cdrom = buffer;
                 break;
             case "fda":
-                settings.fda = this.disk_images.fda = buffer;
+                settings.fda = buffer;
                 break;
             case "fdb":
-                settings.fdb = this.disk_images.fdb = buffer;
+                settings.fdb = buffer;
                 break;
 
             case "multiboot":
-                settings.multiboot = this.disk_images.multiboot = buffer.buffer;
+                settings.multiboot = buffer.buffer;
                 break;
             case "bzimage":
-                settings.bzimage = this.disk_images.bzimage = buffer.buffer;
+                settings.bzimage = buffer.buffer;
                 break;
             case "initrd":
-                settings.initrd = this.disk_images.initrd = buffer.buffer;
+                settings.initrd = buffer.buffer;
                 break;
 
             case "bios":
@@ -422,7 +481,15 @@ V86.prototype.continue_init = async function(emulator, options)
     add_file("bzimage", options.bzimage);
     add_file("initrd", options.initrd);
 
-    if(options.filesystem)
+    if(options.filesystem && options.filesystem.handle9p)
+    {
+        settings.handle9p = options.filesystem.handle9p;
+    }
+    else if(options.filesystem && options.filesystem.proxy_url)
+    {
+        settings.proxy9p = options.filesystem.proxy_url;
+    }
+    else if(options.filesystem)
     {
         var fs_url = options.filesystem.basefs;
         var base_url = options.filesystem.baseurl;
@@ -431,7 +498,7 @@ V86.prototype.continue_init = async function(emulator, options)
 
         if(base_url)
         {
-            file_storage = new ServerFileStorageWrapper(file_storage, base_url);
+            file_storage = new ServerFileStorageWrapper(file_storage, base_url, this.zstd_decompress.bind(this));
         }
         settings.fs9p = this.fs9p = new FS(file_storage);
 
@@ -564,8 +631,24 @@ V86.prototype.continue_init = async function(emulator, options)
         }
 
         this.serial_adapter && this.serial_adapter.show && this.serial_adapter.show();
+        this.virtio_console_adapter && this.virtio_console_adapter.show && this.virtio_console_adapter.show();
+
+        if(!settings.initial_state)
+        {
+            // ide needs to read the mbr to calculate the device geometry
+            if(settings.hda)
+            {
+                await new Promise(resolve => settings.hda.get_and_cache(0, 512, resolve));
+            }
+            if(settings.hdb)
+            {
+                await new Promise(resolve => settings.hdb.get_and_cache(0, 512, resolve));
+            }
+        }
 
         this.v86.init(settings);
+
+        this.modem && this.modem.initialize();
 
         if(settings.initial_state)
         {
@@ -629,11 +712,10 @@ V86.prototype.zstd_decompress_worker = async function(decompressed_size, src)
                 {
                     const env = Object.fromEntries([
                         "cpu_exception_hook", "run_hardware_timers",
-                        "cpu_event_halt", "microtick", "get_rand_int",
-                        "apic_acknowledge_irq", "stop_idling",
+                        "cpu_event_halt", "microtick", "get_rand_int", "stop_idling",
                         "io_port_read8", "io_port_read16", "io_port_read32",
                         "io_port_write8", "io_port_write16", "io_port_write32",
-                        "mmap_read8", "mmap_read16", "mmap_read32",
+                        "mmap_read8", "mmap_read32",
                         "mmap_write8", "mmap_write16", "mmap_write32", "mmap_write64", "mmap_write128",
                         "codegen_finalize",
                         "jit_clear_func", "jit_clear_all_funcs",
@@ -642,7 +724,7 @@ V86.prototype.zstd_decompress_worker = async function(decompressed_size, src)
                     env["__indirect_function_table"] = new WebAssembly.Table({ element: "anyfunc", initial: 1024 });
                     env["abort"] = () => { throw new Error("zstd worker aborted"); };
                     env["log_from_wasm"] = env["console_log_from_wasm"] = (off, len) => {
-                        console.log(String.fromCharCode(...new Uint8Array(wasm.exports.memory.buffer, off, len)));
+                        console.log(read_sized_string_from_mem(wasm.exports.memory.buffer, off, len));
                     };
                     env["dbg_trace_from_wasm"] = () => console.trace();
 
@@ -765,6 +847,8 @@ V86.prototype.destroy = async function()
     this.screen_adapter && this.screen_adapter.destroy();
     this.serial_adapter && this.serial_adapter.destroy();
     this.speaker_adapter && this.speaker_adapter.destroy();
+    this.virtio_console_adapter && this.virtio_console_adapter.destroy();
+    this.modem && this.modem.destroy();
 };
 
 /**
@@ -861,13 +945,17 @@ V86.prototype.is_running = function()
  */
 V86.prototype.set_fda = async function(file)
 {
+    const fda = this.v86.cpu.devices.fdc.drives[0];
     if(file.url && !file.async)
     {
-        load_file(file.url, {
-            done: result =>
-            {
-                this.v86.cpu.devices.fdc.set_fda(new SyncBuffer(result));
-            },
+        await new Promise(resolve => {
+            load_file(file.url, {
+                done: result =>
+                {
+                    fda.insert_disk(new SyncBuffer(result));
+                    resolve();
+                }
+            });
         });
     }
     else
@@ -875,18 +963,73 @@ V86.prototype.set_fda = async function(file)
         const image = buffer_from_object(file, this.zstd_decompress_worker.bind(this));
         image.onload = () =>
         {
-            this.v86.cpu.devices.fdc.set_fda(image);
+            fda.insert_disk(image);
         };
         await image.load();
     }
 };
 
 /**
- * Eject the floppy drive.
+ * Set the image inserted in the second floppy drive, also at runtime.
+ */
+V86.prototype.set_fdb = async function(file)
+{
+    const fdb = this.v86.cpu.devices.fdc.drives[1];
+    if(file.url && !file.async)
+    {
+        await new Promise(resolve => {
+            load_file(file.url, {
+                done: result =>
+                {
+                    fdb.insert_disk(new SyncBuffer(result));
+                    resolve();
+                }
+            });
+        });
+    }
+    else
+    {
+        const image = buffer_from_object(file, this.zstd_decompress_worker.bind(this));
+        image.onload = () =>
+        {
+            fdb.insert_disk(image);
+        };
+        await image.load();
+    }
+};
+
+/**
+ * Eject floppy drive fda.
  */
 V86.prototype.eject_fda = function()
 {
-    this.v86.cpu.devices.fdc.eject_fda();
+    this.v86.cpu.devices.fdc.drives[0].eject_disk();
+};
+
+/**
+ * Eject second floppy drive fdb.
+ */
+V86.prototype.eject_fdb = function()
+{
+    this.v86.cpu.devices.fdc.drives[1].eject_disk();
+};
+
+/**
+ * Return buffer object of floppy disk of drive fda or null if the drive is empty.
+ * @return {Uint8Array|null}
+ */
+V86.prototype.get_disk_fda = function()
+{
+    return this.v86.cpu.devices.fdc.drives[0].get_buffer();
+};
+
+/**
+ * Return buffer object of second floppy disk of drive fdb or null if the drive is empty.
+ * @return {Uint8Array|null}
+ */
+V86.prototype.get_disk_fdb = function()
+{
+    return this.v86.cpu.devices.fdc.drives[1].get_buffer();
 };
 
 /**
@@ -929,34 +1072,42 @@ V86.prototype.eject_cdrom = function()
  * Do nothing if there is no keyboard controller.
  *
  * @param {Array.<number>} codes
+ * @param {number=} delay
  */
-V86.prototype.keyboard_send_scancodes = function(codes)
+V86.prototype.keyboard_send_scancodes = async function(codes, delay)
 {
     for(var i = 0; i < codes.length; i++)
     {
         this.bus.send("keyboard-code", codes[i]);
+        if(delay) await new Promise(resolve => setTimeout(resolve, delay));
     }
 };
 
 /**
  * Send translated keys
+ * @param {Array.<number>} codes
+ * @param {number=} delay
  */
-V86.prototype.keyboard_send_keys = function(codes)
+V86.prototype.keyboard_send_keys = async function(codes, delay)
 {
     for(var i = 0; i < codes.length; i++)
     {
         this.keyboard_adapter.simulate_press(codes[i]);
+        if(delay) await new Promise(resolve => setTimeout(resolve, delay));
     }
 };
 
 /**
  * Send text, assuming the guest OS uses a US keyboard layout
+ * @param {string} string
+ * @param {number=} delay
  */
-V86.prototype.keyboard_send_text = function(string)
+V86.prototype.keyboard_send_text = async function(string, delay)
 {
     for(var i = 0; i < string.length; i++)
     {
         this.keyboard_adapter.simulate_char(string[i]);
+        if(delay) await new Promise(resolve => setTimeout(resolve, delay));
     }
 };
 
@@ -1057,6 +1208,7 @@ V86.prototype.mouse_set_enabled = function(enabled)
     if(this.mouse_adapter)
     {
         this.mouse_adapter.emu_enabled = enabled;
+        this.mouse_adapter.update_cursor();
     }
 };
 V86.prototype.mouse_set_status = V86.prototype.mouse_set_enabled;
@@ -1102,15 +1254,10 @@ V86.prototype.serial_send_bytes = function(serial, data)
 };
 
 /**
- * Set the modem status of a serial port.
- */
-V86.prototype.serial_set_modem_status = function(serial, status)
-{
-    this.bus.send("serial" + serial + "-modem-status-input", status);
-};
-
-/**
- * Set the carrier detect status of a serial port.
+ * Set or clear the data carrier detect (DCD) status of a serial port.
+ *
+ * @param {number} serial
+ * @param {boolean} status
  */
 V86.prototype.serial_set_carrier_detect = function(serial, status)
 {
@@ -1118,7 +1265,10 @@ V86.prototype.serial_set_carrier_detect = function(serial, status)
 };
 
 /**
- * Set the ring indicator status of a serial port.
+ * Set or clear the ring indicator (RING) status of a serial port.
+ *
+ * @param {number} serial
+ * @param {boolean} status
  */
 V86.prototype.serial_set_ring_indicator = function(serial, status)
 {
@@ -1126,7 +1276,10 @@ V86.prototype.serial_set_ring_indicator = function(serial, status)
 };
 
 /**
- * Set the data set ready status of a serial port.
+ * Set or clear the data set ready (DSR) status of a serial port.
+ *
+ * @param {number} serial
+ * @param {boolean} status
  */
 V86.prototype.serial_set_data_set_ready = function(serial, status)
 {
@@ -1134,49 +1287,14 @@ V86.prototype.serial_set_data_set_ready = function(serial, status)
 };
 
 /**
- * Set the clear to send status of a serial port.
+ * Set or clear the clear to send (CTS) status of a serial port.
+ *
+ * @param {number} serial
+ * @param {boolean} status
  */
 V86.prototype.serial_set_clear_to_send = function(serial, status)
 {
     this.bus.send("serial" + serial + "-clear-to-send-input", status);
-};
-
-/**
- * Mount another filesystem to the current filesystem.
- * @param {string} path Path for the mount point
- * @param {string|undefined} baseurl
- * @param {string|undefined} basefs As a JSON string
- */
-V86.prototype.mount_fs = async function(path, baseurl, basefs)
-{
-    let file_storage = new MemoryFileStorage();
-
-    if(baseurl)
-    {
-        file_storage = new ServerFileStorageWrapper(file_storage, baseurl);
-    }
-    const newfs = new FS(file_storage, this.fs9p.qidcounter);
-    if(baseurl)
-    {
-        dbg_assert(typeof basefs === "object", "Filesystem: basefs must be a JSON object");
-        newfs.load_from_json(basefs);
-    }
-
-    const idx = this.fs9p.Mount(path, newfs);
-
-    if(idx === -ENOENT)
-    {
-        throw new FileNotFoundError();
-    }
-    else if(idx === -EEXIST)
-    {
-        throw new FileExistsError();
-    }
-    else if(idx < 0)
-    {
-        dbg_assert(false, "Unexpected error code: " + (-idx));
-        throw new Error("Failed to mount. Error number: " + (-idx));
-    }
 };
 
 /**
@@ -1299,52 +1417,110 @@ V86.prototype.automatically = function(steps)
     run(steps);
 };
 
-V86.prototype.wait_until_vga_screen_contains = function(text)
+/**
+ * Wait until expected text is present on the VGA text screen.
+ *
+ * Returns immediately if the expected text is already present on screen
+ * at the time this funtion is called.
+ *
+ * An optional timeout may be specified in `options.timeout_msec`, returns
+ * false if the timeout expires before the expected text could be detected.
+ *
+ * Expected text (or texts, see below) must be of type string or RegExp,
+ * strings are tested against the beginning of a screen line, regular
+ * expressions against the full line but may use wildcards for partial
+ * matching.
+ *
+ * Two methods of text detection are supported depending on the type of the
+ * argument `expected`:
+ *
+ * 1. If `expected` is a string or RegExp then the given text string or
+ *    regular expression may match any line on screen for this function
+ *    to succeed.
+ *
+ * 2. If `expected` is an array of strings and/or RegExp objects then the
+ *    list of expected lines must match exactly at "the bottom" of the
+ *    screen. The "bottom" line is the first non-empty line starting from
+ *    the screen's end.
+ *    Expected lines should not contain any trailing whitespace and/or
+ *    newline characters. Expecting an empty line is valid.
+ *
+ * Returns `true` on success and `false` when the timeout has expired.
+ *
+ * @param {string|RegExp|Array<string|RegExp>} expected
+ * @param {{timeout_msec:(number|undefined)}=} options
+ */
+V86.prototype.wait_until_vga_screen_contains = async function(expected, options)
 {
-    return new Promise(resolve =>
+    const match_multi = Array.isArray(expected);
+    const timeout_msec = options?.timeout_msec || 0;
+    const changed_rows = new Set();
+    const screen_put_char = args => changed_rows.add(args[0]);
+    const contains_expected = (screen_line, pattern) => pattern.test ? pattern.test(screen_line) : screen_line.startsWith(pattern);
+    const screen_lines = [];
+
+    this.add_listener("screen-put-char", screen_put_char);
+
+    for(const screen_line of this.screen_adapter.get_text_screen())
     {
-        function test_line(line)
+        if(match_multi)
         {
-            return typeof text === "string" ? line.includes(text) : text.test(line);
+            screen_lines.push(screen_line.trimRight());
         }
-
-        for(const line of this.screen_adapter.get_text_screen())
+        else if(contains_expected(screen_line, expected))
         {
-            if(test_line(line))
+            this.remove_listener("screen-put-char", screen_put_char);
+            return true;
+        }
+    }
+
+    let succeeded = false;
+    const end = timeout_msec ? performance.now() + timeout_msec : 0;
+    loop: while(!end || performance.now() < end)
+    {
+        if(match_multi)
+        {
+            let screen_height = screen_lines.length;
+            while(screen_height > 0 && screen_lines[screen_height - 1] === "")
             {
-                resolve(true);
-                return;
+                screen_height--;
             }
-        }
-
-        const changed_rows = new Set();
-
-        function put_char(args)
-        {
-            const [row, col, char] = args;
-            changed_rows.add(row);
-        }
-
-        const check = () =>
-        {
-            for(const row of changed_rows)
+            const screen_offset = screen_height - expected.length;
+            if(screen_offset >= 0)
             {
-                const line = this.screen_adapter.get_text_row(row);
-                if(test_line(line))
+                let matches = true;
+                for(let i = 0; i < expected.length && matches; i++)
                 {
-                    this.remove_listener("screen-put-char", put_char);
-                    resolve();
-                    return;
+                    matches = contains_expected(screen_lines[screen_offset + i], expected[i]);
+                }
+                if(matches)
+                {
+                    succeeded = true;
+                    break;
                 }
             }
+        }
 
-            changed_rows.clear();
-            setTimeout(check, 100);
-        };
-        check();
+        await new Promise(resolve => setTimeout(resolve, 100));
 
-        this.add_listener("screen-put-char", put_char);
-    });
+        for(const row of changed_rows)
+        {
+            const screen_line = this.screen_adapter.get_text_row(row);
+            if(match_multi)
+            {
+                screen_lines[row] = screen_line.trimRight();
+            }
+            else if(contains_expected(screen_line, expected))
+            {
+                succeeded = true;
+                break loop;
+            }
+        }
+        changed_rows.clear();
+    }
+
+    this.remove_listener("screen-put-char", screen_put_char);
+    return succeeded;
 };
 
 /**
@@ -1370,11 +1546,26 @@ V86.prototype.write_memory = function(blob, offset)
     this.v86.cpu.write_blob(blob, offset);
 };
 
-V86.prototype.set_serial_container_xtermjs = function(element)
+/*
+ * @param {HTMLElement} element
+ * @param {Function} [xterm_lib]
+ */
+V86.prototype.set_serial_container_xtermjs = function(element, xterm_lib = window["Terminal"])
 {
     this.serial_adapter && this.serial_adapter.destroy && this.serial_adapter.destroy();
-    this.serial_adapter = new SerialAdapterXtermJS(element, this.bus);
+    this.serial_adapter = new SerialAdapterXtermJS(element, this.bus, xterm_lib);
     this.serial_adapter.show();
+};
+
+/*
+ * @param {HTMLElement} element
+ * @param {Function} [xterm_lib]
+ */
+V86.prototype.set_virtio_console_container_xtermjs = function(element, xterm_lib = window["Terminal"])
+{
+    this.virtio_console_adapter && this.virtio_console_adapter.destroy && this.virtio_console_adapter.destroy();
+    this.virtio_console_adapter = new VirtioConsoleAdapterXtermJS(element, this.bus, xterm_lib);
+    this.virtio_console_adapter.show();
 };
 
 V86.prototype.get_instruction_stats = function()

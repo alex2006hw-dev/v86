@@ -1,6 +1,6 @@
 use crate::cpu::cpu::{
     tlb_data, FLAG_CARRY, FLAG_OVERFLOW, FLAG_SIGN, FLAG_ZERO, OPSIZE_16, OPSIZE_32, OPSIZE_8,
-    TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_USER, TLB_READONLY, TLB_VALID,
+    TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_EXEC, TLB_NO_USER, TLB_READONLY, TLB_VALID,
 };
 use crate::cpu::global_pointers;
 use crate::cpu::memory;
@@ -395,8 +395,41 @@ fn gen_get_last_op1(builder: &mut WasmBuilder, previous_instruction: &Instructio
     }
 }
 
-pub fn gen_get_page_fault(builder: &mut WasmBuilder) {
-    builder.load_fixed_u8(global_pointers::page_fault as u32);
+pub fn gen_readable_or_pagefault(ctx: &mut JitContext, address_local: &WasmLocal, size: i32) {
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(size);
+    ctx.builder
+        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder.call_fn3_ret("readable_or_pagefault_jit");
+    if cfg!(feature = "profiler") {
+        ctx.builder.if_void();
+        gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+        ctx.builder.br(ctx.exit_with_fault_label);
+        ctx.builder.block_end();
+    }
+    else {
+        ctx.builder.br_if(ctx.exit_with_fault_label);
+    }
+}
+
+pub fn gen_writable_or_pagefault(ctx: &mut JitContext, address_local: &WasmLocal, size: i32) {
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(size);
+    // packed lower bits of eip and wasm table index
+    ctx.builder.const_i32(
+        ctx.start_of_current_instruction as i32 & 0xFFF
+            | (ctx.wasm_table_index.to_u16() as i32) << 16,
+    );
+    ctx.builder.call_fn3_ret("writable_or_pagefault_jit");
+    if cfg!(feature = "profiler") {
+        ctx.builder.if_void();
+        gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+        ctx.builder.br(ctx.exit_with_fault_label);
+        ctx.builder.block_end();
+    }
+    else {
+        ctx.builder.br_if(ctx.exit_with_fault_label);
+    }
 }
 
 /// sign-extend a byte value on the stack and leave it on the stack
@@ -638,6 +671,7 @@ fn gen_safe_read(
             & !TLB_READONLY
             & !TLB_GLOBAL
             & !TLB_HAS_CODE
+            & !TLB_NO_EXEC
             & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32,
     );
     ctx.builder.and_i32();
@@ -849,8 +883,10 @@ fn gen_safe_write(
         .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
     let entry_local = ctx.builder.tee_new_local();
 
-    ctx.builder
-        .const_i32((0xFFF & !TLB_GLOBAL & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32);
+    ctx.builder.const_i32(
+        (0xFFF & !TLB_GLOBAL & !TLB_NO_EXEC & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER }))
+            as i32,
+    );
     ctx.builder.and_i32();
 
     ctx.builder.const_i32(TLB_VALID as i32);
@@ -883,8 +919,13 @@ fn gen_safe_write(
             ctx.builder.get_local_i64(local2)
         },
     }
-    ctx.builder
-        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+
+    // packed lower bits of eip and wasm table index
+    ctx.builder.const_i32(
+        ctx.start_of_current_instruction as i32 & 0xFFF
+            | (ctx.wasm_table_index.to_u16() as i32) << 16,
+    );
+
     match bits {
         BitSize::BYTE => {
             ctx.builder.call_fn3_ret("safe_write8_slow_jit");
@@ -996,8 +1037,10 @@ pub fn gen_safe_read_write(
         .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
     let entry_local = ctx.builder.tee_new_local();
 
-    ctx.builder
-        .const_i32((0xFFF & !TLB_GLOBAL & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32);
+    ctx.builder.const_i32(
+        (0xFFF & !TLB_GLOBAL & !TLB_NO_EXEC & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER }))
+            as i32,
+    );
     ctx.builder.and_i32();
 
     ctx.builder.const_i32(TLB_VALID as i32);
@@ -1023,8 +1066,12 @@ pub fn gen_safe_read_write(
     }
 
     ctx.builder.get_local(&address_local);
-    ctx.builder
-        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+
+    // packed lower bits of eip and wasm table index
+    ctx.builder.const_i32(
+        ctx.start_of_current_instruction as i32 & 0xFFF
+            | (ctx.wasm_table_index.to_u16() as i32) << 16,
+    );
 
     match bits {
         BitSize::BYTE => {
@@ -1112,8 +1159,11 @@ pub fn gen_safe_read_write(
             GenSafeReadWriteValue::I64(l) => ctx.builder.get_local_i64(l),
         }
 
-        ctx.builder
-            .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+        // packed lower bits of eip and wasm table index
+        ctx.builder.const_i32(
+            ctx.start_of_current_instruction as i32 & 0xFFF
+                | (ctx.wasm_table_index.to_u16() as i32) << 16,
+        );
 
         match bits {
             BitSize::BYTE => {

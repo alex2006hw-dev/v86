@@ -107,19 +107,19 @@ function gen_instruction_body(encodings, size)
     const encoding = encodings[0];
 
     let has_66 = [];
-    let has_F2 = [];
-    let has_F3 = [];
+    let has_f2 = [];
+    let has_f3 = [];
     let no_prefix = [];
 
     for(let e of encodings)
     {
         if((e.opcode >>> 16) === 0x66) has_66.push(e);
-        else if((e.opcode >>> 8 & 0xFF) === 0xF2 || (e.opcode >>> 16) === 0xF2) has_F2.push(e);
-        else if((e.opcode >>> 8 & 0xFF) === 0xF3 || (e.opcode >>> 16) === 0xF3) has_F3.push(e);
+        else if((e.opcode >>> 8 & 0xFF) === 0xF2 || (e.opcode >>> 16) === 0xF2) has_f2.push(e);
+        else if((e.opcode >>> 8 & 0xFF) === 0xF3 || (e.opcode >>> 16) === 0xF3) has_f3.push(e);
         else no_prefix.push(e);
     }
 
-    if(has_F2.length || has_F3.length)
+    if(has_f2.length || has_f3.length)
     {
         assert((encoding.opcode & 0xFF0000) === 0 || (encoding.opcode & 0xFF00) === 0x0F00);
     }
@@ -136,7 +136,7 @@ function gen_instruction_body(encodings, size)
         code.push(`let modrm_byte = ${wrap_imm_call("read_imm8()")};`);
     }
 
-    if(has_66.length || has_F2.length || has_F3.length)
+    if(has_66.length || has_f2.length || has_f3.length)
     {
         const if_blocks = [];
 
@@ -144,12 +144,12 @@ function gen_instruction_body(encodings, size)
             const body = gen_instruction_body_after_prefix(has_66, size);
             if_blocks.push({ condition: "prefixes_ & prefix::PREFIX_66 != 0", body, });
         }
-        if(has_F2.length) {
-            const body = gen_instruction_body_after_prefix(has_F2, size);
+        if(has_f2.length) {
+            const body = gen_instruction_body_after_prefix(has_f2, size);
             if_blocks.push({ condition: "prefixes_ & prefix::PREFIX_F2 != 0", body, });
         }
-        if(has_F3.length) {
-            const body = gen_instruction_body_after_prefix(has_F3, size);
+        if(has_f3.length) {
+            const body = gen_instruction_body_after_prefix(has_f3, size);
             if_blocks.push({ condition: "prefixes_ & prefix::PREFIX_F3 != 0", body, });
         }
 
@@ -213,8 +213,9 @@ function gen_instruction_body_after_prefix(encodings, size)
                 }),
 
                 default_case: {
+                    varname: "x",
                     body: [
-                        `if DEBUG { panic!("Bad instruction at {:x}", *instruction_pointer); }`,
+                        `dbg_log!("#ud ${encoding.opcode.toString(16).toUpperCase()}/{} at {:x}", x, *instruction_pointer);`,
                         "trigger_ud();",
                     ],
                 }
@@ -413,7 +414,7 @@ function gen_table()
 
             "use crate::cpu::cpu::{after_block_boundary, modrm_resolve};",
             "use crate::cpu::cpu::{read_imm8, read_imm8s, read_imm16, read_imm32s, read_moffs};",
-            "use crate::cpu::cpu::{task_switch_test, trigger_ud, DEBUG};",
+            "use crate::cpu::cpu::{task_switch_test, trigger_ud};",
             "use crate::cpu::instructions;",
             "use crate::cpu::global_pointers::{instruction_pointer, prefixes};",
             "use crate::prefix;",
@@ -478,7 +479,6 @@ function gen_table()
             "use crate::cpu::cpu::{after_block_boundary, modrm_resolve};",
             "use crate::cpu::cpu::{read_imm8, read_imm16, read_imm32s};",
             "use crate::cpu::cpu::{task_switch_test, task_switch_test_mmx, trigger_ud};",
-            "use crate::cpu::cpu::DEBUG;",
             "use crate::cpu::instructions_0f;",
             "use crate::cpu::global_pointers::{instruction_pointer, prefixes};",
             "use crate::prefix;",

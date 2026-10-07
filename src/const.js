@@ -26,7 +26,8 @@ export const
     LOG_VIRTIO = 0x0200000,
     LOG_9P =     0x0400000,
     LOG_SB16 =   0x0800000,
-    LOG_FETCH =  0x1000000;
+    LOG_FETCH =  0x1000000,
+    LOG_MODEM =  0x2000000;
 
 
 /**
@@ -57,6 +58,7 @@ export const LOG_NAMES = [
     [LOG_9P, "9P"],
     [LOG_SB16, "SB16"],
     [LOG_FETCH, "FETC"],
+    [LOG_MODEM, "MODM"],
 ];
 
 export const
@@ -116,6 +118,7 @@ export const FW_CFG_SIGNATURE = 0x00;
 export const FW_CFG_ID = 0x01;
 export const FW_CFG_RAM_SIZE = 0x03;
 export const FW_CFG_NB_CPUS = 0x05;
+export const FW_CFG_BOOT_MENU = 0x0E;
 export const FW_CFG_MAX_CPUS = 0x0F;
 export const FW_CFG_NUMA = 0x0D;
 export const FW_CFG_FILE_DIR = 0x19;

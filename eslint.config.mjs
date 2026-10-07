@@ -37,6 +37,9 @@ export default [
                 "Image": "readonly",
                 "OffscreenCanvas": "readonly",
                 "BroadcastChannel": "readonly",
+                "HTMLElement": "readonly",
+                "HTMLTextAreaElement": "readonly",
+                "AbortController": "readonly",
 
                 "AudioContext": "readonly",
                 "AudioWorkletProcessor": "readonly",
@@ -55,6 +58,9 @@ export default [
             "no-trailing-spaces": "error",
             "no-extra-semi": "error",
             "no-tabs": "error",
+            "id-match": ["error",
+                "^([a-z][a-z0-9_]*|[A-Z][a-zA-Z0-9_]*|_|\\$|__dirname|__filename|spawnSync|execFile|execFileSync|createServer|workerData|parentPort|isMainThread|fileURLToPath|registerProcessor|sampleRate)$",
+                { "onlyDeclarations": true, "properties": false }],
             "quotes": ["error", "double", { "avoidEscape": true, "allowTemplateLiterals": true }],
             "keyword-spacing": ["error", { "overrides": {
                 "if": { "after": false },

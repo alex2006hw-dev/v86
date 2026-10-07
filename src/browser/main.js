@@ -1,7 +1,7 @@
 import { V86 } from "./starter.js";
 import { LOG_NAMES } from "../const.js";
 import { SyncBuffer, SyncFileBuffer } from "../buffer.js";
-import { pad0, pads, hex_dump, dump_file, download, round_up_to_next_power_of_2 } from "../lib.js";
+import { h, pad0, pads, hex_dump, dump_file, download, round_up_to_next_power_of_2 } from "../lib.js";
 import { log_data, LOG_LEVEL, set_log_level } from "../log.js";
 import * as iso9660 from "../iso9660.js";
 
@@ -12,6 +12,10 @@ const DEFAULT_NETWORKING_PROXIES = ["wss://relay.widgetry.org/", "ws://localhost
 const DEFAULT_MEMORY_SIZE = 128;
 const DEFAULT_VGA_MEMORY_SIZE = 8;
 const DEFAULT_BOOT_ORDER = 0;
+const DEFAULT_MTU = 1500;
+const DEFAULT_NIC_TYPE = "ne2k";
+
+const MAX_ARRAY_BUFFER_SIZE_MB = 2000;
 
 function query_append()
 {
@@ -66,9 +70,11 @@ function show_progress(e)
     const el = $("loading");
     el.style.display = "block";
 
-    if(e.file_name.endsWith(".wasm"))
+    const file_name = e.file_name.split("?", 1)[0];
+
+    if(file_name.endsWith(".wasm"))
     {
-        const parts = e.file_name.split("/");
+        const parts = file_name.split("/");
         el.textContent = "Fetching " + parts[parts.length - 1] + " ...";
         return;
     }
@@ -292,28 +298,30 @@ function onload()
             id: "haiku",
             memory_size: 512 * 1024 * 1024,
             hda: {
-                url: host + "haiku-v4/.img",
-                size: 1 * 1024 * 1024 * 1024,
+                url: host + "haiku-v5/.img",
+                size: 1342177280,
                 async: true,
                 fixed_chunk_size: 1024 * 1024,
                 use_parts: true,
             },
-            state: { url: host + "haiku_state-v4.bin.zst" },
+            state: { url: host + "haiku_state-v5.bin.zst" },
             name: "Haiku",
             homepage: "https://www.haiku-os.org/",
+            acpi: true,
         },
         {
             id: "haiku-boot",
             memory_size: 512 * 1024 * 1024,
             hda: {
-                url: host + "haiku-v4/.img",
-                size: 1 * 1024 * 1024 * 1024,
+                url: host + "haiku-v5/.img",
+                size: 1342177280,
                 async: true,
                 fixed_chunk_size: 1024 * 1024,
                 use_parts: true,
             },
             name: "Haiku",
             homepage: "https://www.haiku-os.org/",
+            acpi: true,
         },
         {
             id: "beos",
@@ -326,6 +334,7 @@ function onload()
                 use_parts: true,
             },
             name: "BeOS 5",
+            // NOTE: segfaults if 256k bios is used
         },
         {
             id: "msdos",
@@ -353,6 +362,55 @@ function onload()
                 size: 737280,
             },
             name: "FreeDOS",
+        },
+        {
+            id: "doof",
+            fda: {
+                url: host + "doof-1440.img",
+                size: 1474560,
+            },
+            name: "DOOF",
+            homepage: "https://github.com/fragglet/squashware",
+        },
+        {
+            id: "quantixos",
+            cdrom: {
+                url: host + "quantixos.iso",
+                size: 11784192,
+                async: false,
+            },
+            name: "QuantixOS",
+            homepage: "https://github.com/MrGilli/QuantixOS",
+        },
+        {
+            id: "chip4504",
+            fda: {
+                url: host + "chip4504.img",
+                size: 1474560,
+            },
+            name: "Chip4504",
+            homepage: "https://github.com/RelativisticMechanic/chip4504",
+        },
+        {
+            id: "forthos",
+            hda: {
+                url: host + "forthos20.img.zst",
+                size: 95420416,
+                async: false,
+            },
+            memory_size: 128 * 1024 * 1024,
+            name: "ForthOS",
+            homepage: "http://sources.vsta.org/forthos/",
+        },
+        {
+            id: "chimaeraos",
+            hda: {
+                url: host + "chimaeraos.img",
+                size: 34120704,
+                async: false,
+            },
+            name: "Chimaera OS",
+            homepage: "https://chimaeraos.org/",
         },
         {
             id: "freegem",
@@ -403,6 +461,25 @@ function onload()
                 async: false,
             },
             name: "Oberon",
+        },
+        {
+            id: "gentleos16",
+            fda: {
+                url: host + "gentleos16-fd1440.img",
+                size: 1474560,
+            },
+            name: "GentleOS/16",
+            homepage: "https://github.com/luke8086/gentleos",
+        },
+        {
+            id: "gentleos32",
+            hda: {
+                url: host + "gentleos32-disk.img",
+                size: 8388608,
+                async: false,
+            },
+            name: "GentleOS/32",
+            homepage: "https://github.com/luke8086/gentleos32",
         },
         {
             id: "windows1",
@@ -459,6 +536,7 @@ function onload()
             name: "Buildroot Linux",
             filesystem: {},
             cmdline: "tsc=reliable mitigations=off random.trust_cpu=on",
+            mouse_disabled_default: true,
         },
         {
             id: "buildroot6",
@@ -585,6 +663,7 @@ function onload()
             memory_size: 256 * 1024 * 1024,
             name: "Mu",
             homepage: "https://github.com/akkartik/mu",
+            mouse_disabled_default: true, // https://github.com/akkartik/mu/issues/52
         },
         {
             id: "openbsd",
@@ -637,16 +716,17 @@ function onload()
         {
             id: "crazierl",
             multiboot: {
-                url: host + "crazierl-elf.img",
-                size: 896592,
+                url: host + "crazierl-elf-2026.img",
+                size: 919492,
                 async: false,
             },
             initrd: {
-                url: host + "crazierl-initrd.img",
-                size: 18448316,
+                url: host + "crazierl-initrd-2026.img",
+                size: 20960021,
                 async: false,
             },
             acpi: true,
+            net_device_type: "virtio",
             cmdline: "kernel /libexec/ld-elf32.so.1",
             memory_size: 128 * 1024 * 1024,
             name: "Crazierl",
@@ -704,6 +784,15 @@ function onload()
             },
             name: "Invaders",
             homepage: "https://github.com/nanochess/Invaders",
+        },
+        {
+            id: "bootos",
+            fda: {
+                url: host + "bootos-all.img",
+                size: 368640,
+            },
+            name: "bootOS",
+            homepage: "https://github.com/nanochess/bootOS",
         },
         {
             id: "sectorlisp",
@@ -816,13 +905,13 @@ function onload()
             id: "windows-me",
             memory_size: 256 * 1024 * 1024,
             hda: {
-                url: host + "windowsme-v2/.img",
-                size: 834666496,
+                url: host + "windowsme-v3/.img",
+                size: 1073741824,
                 async: true,
                 fixed_chunk_size: 256 * 1024,
                 use_parts: true,
             },
-            state: { url: host + "windows-me_state-v2.bin.zst" },
+            state: { url: host + "windows-me_state-v3.bin.zst" },
             name: "Windows ME",
         },
         {
@@ -842,7 +931,7 @@ function onload()
             id: "windowsnt35",
             memory_size: 256 * 1024 * 1024,
             hda: {
-                url: host + "windowsnt351/.img",
+                url: host + "windowsnt351-v2/.img",
                 size: 163577856,
                 async: true,
                 fixed_chunk_size: 256 * 1024,
@@ -891,18 +980,8 @@ function onload()
         {
             id: "windows95",
             memory_size: 64 * 1024 * 1024,
-            // old image:
-            //memory_size: 32 * 1024 * 1024,
-            //hda: {
-            //    url: host + "w95/.img",
-            //    size: 242049024,
-            //    async: true,
-            //    fixed_chunk_size: 256 * 1024,
-            //    use_parts: true,
-            //},
-            //state: { url: host + "windows95_state.bin.zst" },
             hda: {
-                url: host + "windows95-v2/.img",
+                url: host + "windows95-v3/.img",
                 size: 471859200,
                 async: true,
                 fixed_chunk_size: 256 * 1024,
@@ -914,7 +993,7 @@ function onload()
             id: "windows95-boot",
             memory_size: 64 * 1024 * 1024,
             hda: {
-                url: host + "windows95-v2/.img",
+                url: host + "windows95-v3/.img",
                 size: 471859200,
                 async: true,
                 fixed_chunk_size: 256 * 1024,
@@ -923,11 +1002,21 @@ function onload()
             name: "Windows 95",
         },
         {
-            id: "windows30",
+            id: "windows30-old",
             memory_size: 64 * 1024 * 1024,
             cdrom: {
                 url: host + "Win30.iso",
                 size: 7774208,
+                async: false,
+            },
+            name: "Windows 3.0",
+        },
+        {
+            id: "windows30",
+            memory_size: 128 * 1024 * 1024,
+            hda: {
+                url: host + "windows30.img",
+                size: 25165824,
                 async: false,
             },
             name: "Windows 3.0",
@@ -973,6 +1062,19 @@ function onload()
             },
             name: "Sanos",
             homepage: "http://www.jbox.dk/sanos/",
+        },
+        {
+            id: "386bsd",
+            memory_size: 64 * 1024 * 1024,
+            hda: {
+                url: host + "386bsd/.img",
+                size: 536870912,
+                async: true,
+                fixed_chunk_size: 1024 * 1024,
+                use_parts: true,
+            },
+            name: "386BSD",
+            homepage: "https://en.wikipedia.org/wiki/386BSD",
         },
         {
             id: "freebsd",
@@ -1350,6 +1452,17 @@ function onload()
             homepage: "https://newos.org/",
         },
         {
+            id: "newos-notion",
+            hda: {
+                url: host + "newos-notion.img",
+                size: 4128768,
+                async: false,
+            },
+            memory_size: 128 * 1024 * 1024,
+            name: "NewOS Notion",
+            homepage: "http://notion.muelln-kommune.net/newos.html",
+        },
+        {
             id: "aros-broadway",
             name: "AROS Broadway",
             memory_size: 512 * 1024 * 1024,
@@ -1463,6 +1576,96 @@ function onload()
             },
             memory_size: 512 * 1024 * 1024,
             homepage: "https://archive.org/details/brightv4000"
+        },
+        {
+            id: "archhurd",
+            name: "Arch Hurd",
+            hda: {
+                url: host + "archhurd-2018.09.28/.img.zst",
+                size: 4294967296,
+                async: true,
+                fixed_chunk_size: 1024 * 1024,
+                use_parts: true,
+            },
+            memory_size: 512 * 1024 * 1024,
+            homepage: "https://archhurd.org/",
+        },
+        {
+            id: "prettyos",
+            name: "PrettyOS",
+            fda: {
+                url: host + "prettyos.img",
+                size: 1474560,
+                async: false,
+            },
+            homepage: "https://www.prettyos.de/Image.html",
+        },
+        {
+            id: "vanadium",
+            name: "Vanadium OS",
+            cdrom: {
+                url: host + "vanadiumos.iso",
+                size: 8388608,
+                async: false,
+            },
+            homepage: "https://www.durlej.net/software.html",
+        },
+        {
+            id: "xenus",
+            name: "XENUS",
+            hda: {
+                url: host + "xenushdd.img",
+                size: 52428800,
+                async: false,
+            },
+            homepage: "https://www.durlej.net/xenus/",
+        },
+        {
+            id: "mojo",
+            name: "Mojo OS",
+            cdrom: {
+                url: host + "mojo-0.2.2.iso",
+                size: 4048896,
+                async: false,
+            },
+            homepage: "https://archiveos.org/mojoos/",
+        },
+        {
+            id: "bsdos",
+            memory_size: 128 * 1024 * 1024,
+            name: "BSD/OS",
+            hda: {
+                url: host + "bsdos43/.img.zst",
+                size: 1024 * 1024 * 1024,
+                async: true,
+                fixed_chunk_size: 1024 * 1024,
+                use_parts: true,
+            },
+            state: { url: host + "bsdos43_state.bin" },
+            homepage: "https://en.wikipedia.org/wiki/BSD/OS",
+        },
+        {
+            id: "bsdos-boot",
+            memory_size: 128 * 1024 * 1024,
+            name: "BSD/OS",
+            hda: {
+                url: host + "bsdos43/.img.zst",
+                size: 1024 * 1024 * 1024,
+                async: true,
+                fixed_chunk_size: 1024 * 1024,
+                use_parts: true,
+            },
+            homepage: "https://en.wikipedia.org/wiki/BSD/OS",
+        },
+        {
+            id: "asuro",
+            name: "Asuro",
+            cdrom: {
+                url: host + "asuro.iso",
+                size: 5361664,
+                async: false,
+            },
+            homepage: "https://asuro.xyz/",
         },
     ];
 
@@ -1591,6 +1794,52 @@ function onload()
     if(query_args.has("mute")) $("disable_audio").checked = bool_arg(query_args.get("mute"));
     if(query_args.has("acpi")) $("acpi").checked = bool_arg(query_args.get("acpi"));
     if(query_args.has("boot_order")) $("boot_order").value = query_args.get("boot_order");
+    if(query_args.has("net_device_type")) $("net_device_type").value = query_args.get("net_device_type");
+    if(query_args.has("mtu")) $("mtu").value = query_args.get("mtu");
+    if(query_args.has("modem")) $("modem").value = query_args.get("modem");
+
+    $("mtu_ui").style.display = $("net_device_type").value === "virtio" ? "table-row" : "none";
+    $("net_device_type").onchange = function()
+    {
+        $("mtu_ui").style.display = $("net_device_type").value === "virtio" ? "table-row" : "none";
+        $("net_device_type").blur();
+    };
+
+    for(const dev of ["fda", "fdb"])
+    {
+        const toggle = $(dev + "_toggle_empty_disk");
+        if(!toggle) continue;
+
+        toggle.onclick = function(e)
+        {
+            e.preventDefault();
+            const select = document.createElement("select");
+            select.id = dev + "_empty_size";
+            for(const n_sect of [320, 360, 400, 640, 720, 800, 1440, 2400, 2880, 3444, 5760, 7680])
+            {
+                const n_bytes = n_sect * 512, kb = 1024, MB = kb * 1000;
+                const option = document.createElement("option");
+                if(n_bytes < MB)
+                {
+                    option.textContent = (n_bytes / kb) + " kB";
+                }
+                else
+                {
+                    option.textContent = (n_bytes / MB).toFixed(2) + " MB";
+                }
+                if(n_sect === 2880)
+                {
+                    option.selected = true;
+                }
+                option.value = n_bytes;
+                select.appendChild(option);
+            }
+            // TODO (when closure compiler supports it): parent.parentNode.replaceChildren(...);
+            const parent = toggle.parentNode;
+            parent.innerHTML = "";
+            parent.append("Empty disk of ", select);
+        };
+    }
 
     for(const dev of ["hda", "hdb"])
     {
@@ -1603,7 +1852,9 @@ function onload()
             const input = document.createElement("input");
             input.id = dev + "_empty_size";
             input.type = "number";
-            input.min = "1";
+            input.min = "0";
+            input.max = String(MAX_ARRAY_BUFFER_SIZE_MB);
+            input.step = "100";
             input.value = "100";
             // TODO (when closure compiler supports it): parent.parentNode.replaceChildren(...);
             const parent = toggle.parentNode;
@@ -1612,7 +1863,7 @@ function onload()
         };
     }
 
-    const os_info = Array.from(document.querySelectorAll("#oses tbody tr")).map(element =>
+    const os_info = Array.from(document.querySelectorAll("#oses a.tr")).map(element =>
     {
         const [_, size_raw, unit] = element.children[1].textContent.match(/([\d\.]+)\+? (\w+)/);
         let size = +size_raw;
@@ -1707,6 +1958,18 @@ function onload()
         {
             os.element.style.display = conjunction.every(disjunction => disjunction.some(filter => filter.condition(os))) ? "" : "none";
         }
+    }
+
+    if($("reset_filters"))
+    {
+        $("reset_filters").onclick = function()
+        {
+            for(const element of document.querySelectorAll("#filter input[type=checkbox]"))
+            {
+                element.checked = false;
+            }
+            update_filters();
+        };
     }
 
     function set_proxy_value(id, value)
@@ -1827,6 +2090,7 @@ function start_emulation(profile, query_args)
         settings.initial_state = profile.state;
         settings.filesystem = profile.filesystem;
         settings.fda = profile.fda;
+        settings.fdb = profile.fdb;
         settings.cdrom = profile.cdrom;
         settings.hda = profile.hda;
         settings.hdb = profile.hdb;
@@ -1842,6 +2106,7 @@ function start_emulation(profile, query_args)
         settings.vga_memory_size = profile.vga_memory_size;
         settings.boot_order = profile.boot_order;
         settings.net_device_type = profile.net_device_type;
+        settings.modem = profile.modem;
 
         if(!DEBUG && profile.homepage)
         {
@@ -1942,11 +2207,21 @@ function start_emulation(profile, query_args)
             settings.acpi = query_args.has("acpi") ? bool_arg(query_args.get("acpi")) : settings.acpi;
             settings.use_bochs_bios = query_args.get("bios") === "bochs";
             settings.net_device_type = query_args.get("net_device_type") || settings.net_device_type;
+            settings.mtu = parseInt(query_args.get("mtu"), 10) || undefined;
         }
 
         settings.relay_url = query_args.get("relay_url");
         settings.disable_jit = bool_arg(query_args.get("disable_jit"));
         settings.disable_audio = bool_arg(query_args.get("mute"));
+
+        if(query_args.has("modem"))
+        {
+            const modem = parseInt(query_args.get("modem"), 10);
+            if(!Number.isNaN(modem) && modem >= 0 && modem < 4)
+            {
+                settings.modem = {uart: modem};
+            }
+        }
     }
 
     if(!settings.relay_url)
@@ -1975,10 +2250,25 @@ function start_emulation(profile, query_args)
         {
             settings.vga_bios = { buffer: vga_bios };
         }
-        const fda = $("floppy_image").files[0];
+        const fda = $("fda_image")?.files[0];
         if(fda)
         {
             settings.fda = { buffer: fda };
+        }
+        const fda_empty_size = +$("fda_empty_size")?.value;
+        if(fda_empty_size)
+        {
+            settings.fda = { buffer: new ArrayBuffer(fda_empty_size) };
+        }
+        const fdb = $("fdb_image")?.files[0];
+        if(fdb)
+        {
+            settings.fdb = { buffer: fdb };
+        }
+        const fdb_empty_size = +$("fdb_empty_size")?.value;
+        if(fdb_empty_size)
+        {
+            settings.fdb = { buffer: new ArrayBuffer(fdb_empty_size) };
         }
         const cdrom = $("cdrom_image").files[0];
         if(cdrom)
@@ -1993,7 +2283,7 @@ function start_emulation(profile, query_args)
         const hda_empty_size = +$("hda_empty_size")?.value;
         if(hda_empty_size)
         {
-            const size = hda_empty_size * 1024 * 1024;
+            const size = Math.max(1, Math.min(MAX_ARRAY_BUFFER_SIZE_MB, hda_empty_size)) * 1024 * 1024;
             settings.hda = { buffer: new ArrayBuffer(size) };
             new_query_args.set("hda.empty", String(size));
         }
@@ -2005,8 +2295,8 @@ function start_emulation(profile, query_args)
         const hdb_empty_size = +$("hdb_empty_size")?.value;
         if(hdb_empty_size)
         {
-            const size = hdb_empty_size * 1024 * 1024;
-            settings.hdb = { buffer: new ArrayBuffer(hdb_empty_size * 1024 * 1024) };
+            const size = Math.max(1, Math.min(MAX_ARRAY_BUFFER_SIZE_MB, hdb_empty_size)) * 1024 * 1024;
+            settings.hdb = { buffer: new ArrayBuffer(size) };
             new_query_args.set("hdb.empty", String(size));
         }
         const multiboot = $("multiboot_image")?.files[0];
@@ -2075,6 +2365,27 @@ function start_emulation(profile, query_args)
             settings.bios = { url: BIOSPATH + "bochs-bios.bin" };
             settings.vga_bios = { url: BIOSPATH + "bochs-vgabios.bin" };
         }
+
+        const nic_type = $("net_device_type").value || DEFAULT_NIC_TYPE;
+        if(!settings.net_device_type || nic_type !== DEFAULT_NIC_TYPE)
+        {
+            settings.net_device_type = nic_type;
+        }
+        if(settings.net_device_type !== DEFAULT_NIC_TYPE) new_query_args.set("net_device_type", settings.net_device_type);
+
+        const mtu = parseInt($("mtu").value, 10) || DEFAULT_MTU;
+        if(!settings.mtu || mtu !== DEFAULT_MTU)
+        {
+            settings.mtu = mtu;
+        }
+        if(settings.mtu !== DEFAULT_MTU) new_query_args.set("mtu", settings.mtu.toString());
+
+        const modem = parseInt($("modem").value, 10);
+        if(!Number.isNaN(modem) && modem >= 0 && modem < 4)
+        {
+            settings.modem = {uart: modem};
+            new_query_args.set("modem", modem.toString());
+        }
     }
 
     if(!query_args)
@@ -2089,10 +2400,12 @@ function start_emulation(profile, query_args)
             use_graphical_text: false,
         },
         net_device: {
-            type: settings.net_device_type || "ne2k",
+            type: settings.net_device_type || DEFAULT_NIC_TYPE,
             relay_url: settings.relay_url,
-            cors_proxy: settings.cors_proxy
+            cors_proxy: settings.cors_proxy,
+            mtu: settings.mtu
         },
+        modem: settings.modem,
         autostart: true,
 
         memory_size: settings.memory_size,
@@ -2102,6 +2415,7 @@ function start_emulation(profile, query_args)
         bios: settings.bios,
         vga_bios: settings.vga_bios,
         fda: settings.fda,
+        fdb: settings.fdb,
         hda: settings.hda,
         hdb: settings.hdb,
         cdrom: settings.cdrom,
@@ -2174,6 +2488,11 @@ function start_emulation(profile, query_args)
                 emulator.serial0_send(query_args.get("s") + "\n");
             }, 25);
         }
+
+        if(query_args?.has("theatre") && bool_arg(query_args?.get("theatre")))
+        {
+            $("toggle_theatre").click();
+        }
     });
 
     emulator.add_listener("emulator-loaded", function()
@@ -2208,14 +2527,18 @@ function init_ui(profile, settings, emulator)
     $("runtime_infos").style.display = "block";
     $("screen_container").style.display = "block";
 
+    var filesystem_is_enabled = false;
+
     if(settings.filesystem)
     {
+        filesystem_is_enabled = true;
         init_filesystem_panel(emulator);
     }
     else
     {
         emulator.add_listener("9p-attach", function()
         {
+            filesystem_is_enabled = true;
             init_filesystem_panel(emulator);
         });
     }
@@ -2224,12 +2547,12 @@ function init_ui(profile, settings, emulator)
     {
         if(emulator.is_running())
         {
-            $("run").value = "Run";
+            $("run").textContent = "Run";
             emulator.stop();
         }
         else
         {
-            $("run").value = "Pause";
+            $("run").textContent = "Pause";
             emulator.run();
         }
 
@@ -2239,9 +2562,9 @@ function init_ui(profile, settings, emulator)
     $("exit").onclick = function()
     {
         emulator.destroy();
-        const url = new URL(location.href);
-        url.searchParams.delete("profile");
-        location.href = url.pathname + url.search;
+        const params = new URLSearchParams(location.search);
+        params.delete("profile");
+        location.href = location.pathname + format_query_args(params);
     };
 
     $("lock_mouse").onclick = function()
@@ -2262,8 +2585,124 @@ function init_ui(profile, settings, emulator)
         mouse_is_enabled = !mouse_is_enabled;
 
         emulator.mouse_set_enabled(mouse_is_enabled);
-        $("toggle_mouse").value = (mouse_is_enabled ? "Dis" : "En") + "able mouse";
+        $("toggle_mouse").textContent = (mouse_is_enabled ? "Dis" : "En") + "able mouse";
         $("toggle_mouse").blur();
+    };
+
+    if(profile?.mouse_disabled_default)
+    {
+        $("toggle_mouse").onclick();
+    }
+
+    var theatre_mode = false;
+    var theatre_ui = true;
+    var theatre_zoom_to_fit = false;
+
+    function zoom_to_fit()
+    {
+        // reset size
+        emulator.screen_set_scale(1, 1);
+
+        const emulator_screen = $("screen_container").getBoundingClientRect();
+        const emulator_screen_width = emulator_screen.width;
+        const emulator_screen_height = emulator_screen.height;
+
+        const viewport_screen_width = window.innerWidth;
+        const viewport_screen_height = window.innerHeight;
+
+        const n = Math.min(viewport_screen_width / emulator_screen_width, viewport_screen_height / emulator_screen_height);
+        emulator.screen_set_scale(n, n);
+    }
+
+    /**
+     * @param {boolean} enabled
+     */
+    function enable_theatre_ui(enabled)
+    {
+        theatre_ui = enabled;
+
+        $("runtime_options").style.display = theatre_ui ? "block" : "none";
+        $("runtime_infos").style.display = theatre_ui ? "block" : "none";
+        $("filesystem_panel").style.display = (filesystem_is_enabled && theatre_ui) ? "block" : "none";
+
+        $("toggle_ui").textContent = (theatre_ui ? "Hide" : "Show") + " UI";
+    }
+
+    /**
+     * @param {boolean} enabled
+     */
+    function enable_zoom_to_fit(enabled)
+    {
+        theatre_zoom_to_fit = enabled;
+        $("scale").disabled = theatre_zoom_to_fit;
+
+        if(theatre_zoom_to_fit)
+        {
+            window.addEventListener("resize", zoom_to_fit, true);
+            emulator.add_listener("screen-set-size", zoom_to_fit);
+
+            zoom_to_fit();
+        }
+        else
+        {
+            window.removeEventListener("resize", zoom_to_fit, true);
+            emulator.remove_listener("screen-set-size", zoom_to_fit);
+
+            const n = parseFloat($("scale").value) || 1;
+            emulator.screen_set_scale(n, n);
+        }
+
+        $("toggle_zoom_to_fit").textContent = (theatre_zoom_to_fit ? "Dis" : "En") + "able zoom to fit";
+    }
+
+    /**
+     * @param {boolean} enabled
+     */
+    function enable_theatre_mode(enabled)
+    {
+        theatre_mode = enabled;
+
+        if(!theatre_ui)
+        {
+            enable_theatre_ui(true);
+        }
+
+        if(!theatre_mode && theatre_zoom_to_fit)
+        {
+            enable_zoom_to_fit(false);
+        }
+
+        for(const el of ["screen_container", "runtime_options", "runtime_infos", "filesystem_panel"])
+        {
+            $(el).classList.toggle("theatre_" + el);
+        }
+
+        $("theatre_background").style.display = theatre_mode ? "block" : "none";
+        $("toggle_zoom_to_fit").style.display = theatre_mode ? "inline" : "none";
+        $("toggle_ui").style.display = theatre_mode ? "block" : "none";
+
+        // hide scrolling
+        document.body.style.overflow = theatre_mode ? "hidden" : "visible";
+
+        $("toggle_theatre").textContent = (theatre_mode ? "Dis" : "En") + "able theatre mode";
+    }
+
+    $("toggle_ui").onclick = function()
+    {
+        enable_theatre_ui(!theatre_ui);
+        $("toggle_ui").blur();
+    };
+
+    $("toggle_theatre").onclick = function()
+    {
+        enable_theatre_mode(!theatre_mode);
+        $("toggle_theatre").blur();
+    };
+
+    $("toggle_zoom_to_fit").onclick = function()
+    {
+        enable_zoom_to_fit(!theatre_zoom_to_fit);
+        $("toggle_zoom_to_fit").blur();
     };
 
     var last_tick = 0;
@@ -2271,6 +2710,7 @@ function init_ui(profile, settings, emulator)
     var last_instr_counter = 0;
     var interval = null;
     var os_uses_mouse = false;
+    var os_uses_absolute_mouse = false;
     var total_instructions = 0;
 
     function update_info()
@@ -2366,7 +2806,7 @@ function init_ui(profile, settings, emulator)
         write_sectors: 0,
     };
 
-    $("ide_type").textContent = emulator.disk_images.cdrom ? " (CD-ROM)" : " (hard disk)";
+    $("ide_type").textContent = settings.cdrom ? " (CD-ROM)" : " (hard disk)";
 
     emulator.add_listener("ide-read-start", function()
     {
@@ -2418,6 +2858,11 @@ function init_ui(profile, settings, emulator)
         $("info_mouse_enabled").textContent = is_enabled ? "Yes" : "No";
     });
 
+    emulator.add_listener("vmware-absolute-mouse", function(is_enabled)
+    {
+        os_uses_absolute_mouse = is_enabled;
+    });
+
     emulator.add_listener("screen-set-size", function(args)
     {
         const [w, h, bpp] = args;
@@ -2432,26 +2877,25 @@ function init_ui(profile, settings, emulator)
         $("reset").blur();
     };
 
-    add_image_download_button(settings.hda, emulator.disk_images.hda, "hda");
-    add_image_download_button(settings.hdb, emulator.disk_images.hdb, "hdb");
-    add_image_download_button(settings.fda, emulator.disk_images.fda, "fda");
-    add_image_download_button(settings.fdb, emulator.disk_images.fdb, "fdb");
-    add_image_download_button(settings.cdrom, emulator.disk_images.cdrom, "cdrom");
+    add_image_download_button(settings.hda, () => emulator.v86.cpu.devices.ide.primary.master.buffer, "hda");
+    add_image_download_button(settings.hdb, () => emulator.v86.cpu.devices.ide.primary.slave.buffer, "hdb");
+    add_image_download_button(settings.fda, () => emulator.v86.cpu.devices.fdc.drives[0].buffer, "fda");
+    add_image_download_button(settings.fdb, () => emulator.v86.cpu.devices.fdc.drives[1].buffer, "fdb");
+    add_image_download_button(settings.cdrom, () => emulator.v86.cpu.devices.cdrom.buffer, "cdrom");
 
-    function add_image_download_button(obj, buffer, type)
+    function add_image_download_button(obj, get_buffer, type)
     {
         var elem = $("get_" + type + "_image");
 
         if(!obj || obj.async)
         {
             elem.style.display = "none";
-            return;
         }
 
         elem.onclick = function(e)
         {
-            // XXX: the filename is a bit confusing for empty disks (it chooses the profile name)
-            const filename = buffer.file && buffer.file.name || ((profile?.id || "v86") + (type === "cdrom" ? ".iso" : ".img"));
+            const buffer = get_buffer();
+            const filename = buffer.file && buffer.file.name || ((profile?.id || "v86") + "-" + type + (type === "cdrom" ? ".iso" : ".img"));
 
             if(buffer.get_as_file)
             {
@@ -2477,75 +2921,159 @@ function init_ui(profile, settings, emulator)
         };
     }
 
-    $("change_fda_image").value = settings.fda ? "Eject floppy image" : "Insert floppy image";
-    $("change_fda_image").onclick = function()
+    function pick_file(multiple)
     {
-        if(emulator.v86.cpu.devices.fdc.fda_image)
+        return new Promise(resolve => {
+            const file_input = document.createElement("input");
+            file_input.type = "file";
+            file_input.multiple = multiple;
+            file_input.onchange = function()
+            {
+                resolve(file_input.files);
+            };
+            file_input.oncancel = function()
+            {
+                resolve([]);
+            };
+            file_input.click();
+        });
+    }
+
+    $("change_fda_image").textContent = settings.fda ? "Eject floppy image" : "Insert floppy image";
+    $("change_fda_image").ondragover = function(e)
+    {
+        e.preventDefault();
+    };
+    async function insert_fda(files)
+    {
+        const file = files[0];
+        if(file)
+        {
+            await emulator.set_fda({ buffer: file });
+            $("change_fda_image").textContent = "Eject floppy image";
+            $("get_fda_image").style.display = "block";
+        }
+    }
+    $("change_fda_image").ondrop = function(e)
+    {
+        e.preventDefault();
+        if(emulator.get_disk_fda())
         {
             emulator.eject_fda();
-            $("change_fda_image").value = "Insert floppy image";
+        }
+        insert_fda(e.dataTransfer.files);
+    };
+    $("change_fda_image").onclick = async function()
+    {
+        if(emulator.get_disk_fda())
+        {
+            emulator.eject_fda();
+            $("change_fda_image").textContent = "Insert floppy image";
+            $("get_fda_image").style.display = "none";
         }
         else
         {
-            const file_input = document.createElement("input");
-            file_input.type = "file";
-            file_input.onchange = async function(e)
-            {
-                const file = file_input.files[0];
-                if(file)
-                {
-                    await emulator.set_fda({ buffer: file });
-                    $("change_fda_image").value = "Eject floppy image";
-                }
-            };
-            file_input.click();
+            const files = await pick_file(false);
+            insert_fda(files);
         }
         $("change_fda_image").blur();
     };
 
-    $("change_cdrom_image").value = settings.cdrom ? "Eject CD image" : "Insert CD image";
-    $("change_cdrom_image").onclick = function()
+    $("change_fdb_image").textContent = settings.fdb ? "Eject second floppy image" : "Insert second floppy image";
+    $("change_fdb_image").ondragover = function(e)
+    {
+        e.preventDefault();
+    };
+    async function insert_fdb(files)
+    {
+        const file = files[0];
+        if(file)
+        {
+            await emulator.set_fdb({ buffer: file });
+            $("change_fdb_image").textContent = "Eject second floppy image";
+            $("get_fdb_image").style.display = "block";
+        }
+    }
+    $("change_fdb_image").ondrop = function(e)
+    {
+        e.preventDefault();
+        if(emulator.get_disk_fdb())
+        {
+            emulator.eject_fdb();
+        }
+        insert_fdb(e.dataTransfer.files);
+    };
+    $("change_fdb_image").onclick = async function()
+    {
+        if(emulator.get_disk_fdb())
+        {
+            emulator.eject_fdb();
+            $("change_fdb_image").textContent = "Insert second floppy image";
+            $("get_fdb_image").style.display = "none";
+        }
+        else
+        {
+            const files = await pick_file(false);
+            insert_fdb(files);
+        }
+        $("change_fdb_image").blur();
+    };
+
+    $("change_cdrom_image").textContent = settings.cdrom ? "Eject CD image" : "Insert CD image";
+    $("change_cdrom_image").ondragover = function(e)
+    {
+        e.preventDefault();
+    };
+    async function insert_cdrom(files)
+    {
+        let buffer;
+
+        if(files.length === 1 && /\.(iso(9660|img)?|cdr)$/i.test(files[0].name))
+        {
+            buffer = files[0];
+        }
+        else if(files.length)
+        {
+            const files2 = [];
+            for(const file of files)
+            {
+                files2.push({
+                    name: file.name,
+                    contents: new Uint8Array(await read_file(file)),
+                });
+
+            }
+            buffer = iso9660.generate(files2).buffer;
+        }
+
+        if(buffer)
+        {
+            await emulator.set_cdrom({ buffer });
+            $("change_cdrom_image").textContent = "Eject CD image";
+            $("get_cdrom_image").style.display = "block";
+        }
+    }
+    $("change_cdrom_image").ondrop = function(e)
+    {
+        e.preventDefault();
+        if(emulator.v86.cpu.devices.cdrom.has_disk())
+        {
+            emulator.eject_cdrom();
+        }
+        insert_cdrom(e.dataTransfer.files);
+    };
+    $("change_cdrom_image").onclick = async function()
     {
         if(emulator.v86.cpu.devices.cdrom.has_disk())
         {
             emulator.eject_cdrom();
-            $("change_cdrom_image").value = "Insert CD image";
+            $("change_cdrom_image").textContent = "Insert CD image";
+            $("get_cdrom_image").style.display = "none";
         }
         else
         {
-            const file_input = document.createElement("input");
-            file_input.type = "file";
-            file_input.multiple = "multiple";
-            file_input.onchange = async function(e)
-            {
-                const files = file_input.files;
-                let buffer;
-
-                if(files.length === 1 && files[0].name.endsWith(".iso"))
-                {
-                    buffer = files[0];
-                }
-                else if(files.length)
-                {
-                    const files2 = [];
-                    for(const file of files)
-                    {
-                        files2.push({
-                            name: file.name,
-                            contents: new Uint8Array(await read_file(file)),
-                        });
-
-                    }
-                    buffer = iso9660.generate(files2).buffer;
-                }
-
-                if(buffer)
-                {
-                    await emulator.set_cdrom({ buffer });
-                    $("change_cdrom_image").value = "Eject CD image";
-                }
-            };
-            file_input.click();
+            const files = await pick_file(true);
+            insert_cdrom(files);
         }
         $("change_cdrom_image").blur();
     };
@@ -2588,14 +3116,14 @@ function init_ui(profile, settings, emulator)
      */
     $("capture_network_traffic").onclick = function()
     {
-        this.value = "0 packets";
+        this.textContent = "0 packets";
 
         let capture = [];
 
         function do_capture(direction, data)
         {
             capture.push({ direction, time: performance.now() / 1000, hex_dump: hex_dump(data) });
-            $("capture_network_traffic").value = capture.length + " packets";
+            $("capture_network_traffic").textContent = capture.length + " packets";
         }
 
         emulator.emulator_bus.register("net0-receive", do_capture.bind(this, "I"));
@@ -2610,7 +3138,7 @@ function init_ui(profile, settings, emulator)
             }).join("");
             dump_file(capture_raw, "traffic.hex");
             capture = [];
-            this.value = "0 packets";
+            this.textContent = "0 packets";
         };
     };
 
@@ -2623,32 +3151,26 @@ function init_ui(profile, settings, emulator)
         $("save_state").blur();
     };
 
-    $("load_state").onclick = function()
+    $("load_state").onclick = async function()
     {
-        $("load_state_input").click();
         $("load_state").blur();
-    };
 
-    /**
-     * @this HTMLElement
-     */
-    $("load_state_input").onchange = async function()
-    {
-        var file = this.files[0];
+        const files = await pick_file(false);
+        const file = files[0];
 
         if(!file)
         {
             return;
         }
 
-        var was_running = emulator.is_running();
+        const was_running = emulator.is_running();
 
         if(was_running)
         {
             await emulator.stop();
         }
 
-        var filereader = new FileReader();
+        const filereader = new FileReader();
         filereader.onload = async function(e)
         {
             try
@@ -2668,8 +3190,6 @@ function init_ui(profile, settings, emulator)
             }
         };
         filereader.readAsArrayBuffer(file);
-
-        this.value = "";
     };
 
     $("ctrlaltdel").onclick = function()
@@ -2724,30 +3244,33 @@ function init_ui(profile, settings, emulator)
         emulator.screen_go_fullscreen();
     };
 
-    $("screen_container").onclick = function()
+    $("screen_container").onclick = function(e)
     {
-        if(emulator.is_running() && emulator.speaker_adapter && emulator.speaker_adapter.audio_context.state === "suspended")
+        if(emulator.is_running() && emulator.speaker_adapter?.audio_context?.state === "suspended")
         {
             emulator.speaker_adapter.audio_context.resume();
         }
 
-        if(mouse_is_enabled && os_uses_mouse)
+        // No need to lock the mouse if the guest tracks the host cursor
+        // through the absolute pointing device. The "Lock mouse" button can
+        // still be used, e.g. for games (movement is then sent as relative
+        // deltas).
+        if(mouse_is_enabled && os_uses_mouse && !os_uses_absolute_mouse)
         {
             emulator.lock_mouse();
         }
-        else
+
+        // allow text selection
+        if(window.getSelection().isCollapsed)
         {
-            // allow text selection
-            if(window.getSelection().isCollapsed)
-            {
-                const phone_keyboard = document.getElementsByClassName("phone_keyboard")[0];
+            const phone_keyboard = document.getElementsByClassName("phone_keyboard")[0];
 
-                // stop mobile browser from scrolling into view when the keyboard is shown
-                phone_keyboard.style.top = document.body.scrollTop + 100 + "px";
-                phone_keyboard.style.left = document.body.scrollLeft + 100 + "px";
+            phone_keyboard.style.top = window.scrollY + e.clientY + 20 + "px";
+            phone_keyboard.style.left = window.scrollX + e.clientX + "px";
 
-                phone_keyboard.focus();
-            }
+            // clean after previous input
+            phone_keyboard.value = "";
+            phone_keyboard.focus();
         }
     };
 
@@ -2757,11 +3280,6 @@ function init_ui(profile, settings, emulator)
     phone_keyboard.setAttribute("autocapitalize", "off");
     phone_keyboard.setAttribute("spellcheck", "false");
     phone_keyboard.tabIndex = 0;
-
-    $("screen_container").addEventListener("mousedown", e =>
-    {
-        phone_keyboard.focus();
-    }, false);
 
     $("take_screenshot").onclick = function()
     {
@@ -2784,13 +3302,13 @@ function init_ui(profile, settings, emulator)
             {
                 emulator.speaker_adapter.mixer.set_volume(1, undefined);
                 is_muted = false;
-                $("mute").value = "Mute";
+                $("mute").textContent = "Mute";
             }
             else
             {
                 emulator.speaker_adapter.mixer.set_volume(0, undefined);
                 is_muted = true;
-                $("mute").value = "Unmute";
+                $("mute").textContent = "Unmute";
             }
 
             $("mute").blur();
@@ -2827,6 +3345,7 @@ function init_ui(profile, settings, emulator)
     script.onload = function()
     {
         emulator.set_serial_container_xtermjs($("terminal"));
+        emulator.serial_adapter.term.write("This is the serial console. Whatever you type or paste here will be sent to COM1");
     };
     document.body.appendChild(script);
 }
@@ -2922,11 +3441,12 @@ function debug_start(emulator)
         $("debug_panel").textContent =
             cpu.get_regs_short().join("\n") + "\n" + cpu.debug_get_state();
 
-        $("dump_log").value = "Dump log" + (log_data.length ? " (" + log_data.length + " lines)" : "");
+        $("dump_log").textContent = "Dump log" + (log_data.length ? " (" + log_data.length + " lines)" : "");
     }, 1000);
 
     // helps debugging
     window.cpu = cpu;
+    window.h = h;
     window.dump_file = dump_file;
 }
 
@@ -2935,11 +3455,24 @@ function onpopstate(e)
     location.reload();
 }
 
+function format_query_args(params)
+{
+    const entries = Array.from(params.entries());
+    if(entries.length)
+    {
+        return "?" + entries.map(([key, value]) => key + "=" + value.replace(/[?&=#+]/g, encodeURIComponent)).join("&");
+    }
+    else
+    {
+        return "";
+    }
+}
+
 function push_state(params)
 {
     if(window.history.pushState)
     {
-        let search = "?" + Array.from(params.entries()).map(([key, value]) => key + "=" + value.replace(/[?&=#+]/g, encodeURIComponent)).join("&");
+        const search = format_query_args(params);
         window.history.pushState({ search }, "", search);
     }
 }

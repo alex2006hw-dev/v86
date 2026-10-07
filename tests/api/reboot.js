@@ -28,25 +28,43 @@ const config = {
 const emulator = new V86(config);
 
 let did_reboot = false;
+let reboot_finished = false;
+let did_send_echo = false;
 let serial_text = "";
 
 const timeout = setTimeout(() => {
     console.log(serial_text);
     throw new Error("Timeout");
-}, 120 * 1000);
+}, 60 * 1000);
 
 emulator.add_listener("serial0-output-byte", function(byte)
 {
     var chr = String.fromCharCode(byte);
+    //process.stdout.write(chr);
     serial_text += chr;
 
     if(did_reboot)
     {
         if(serial_text.endsWith("Files send via emulator appear in /mnt/"))
         {
-            console.log("Ok");
-            emulator.destroy();
-            clearTimeout(timeout);
+            reboot_finished = true;
+        }
+
+        if(did_send_echo)
+        {
+            if(serial_text.endsWith("finished"))
+            {
+                console.log("Ok");
+                emulator.destroy();
+                clearTimeout(timeout);
+            }
+        }
+        else if(reboot_finished && serial_text.endsWith("~% "))
+        {
+            console.log("running echo");
+            emulator.serial0_send("echo fini''shed\n");
+            serial_text = "";
+            did_send_echo = true;
         }
     }
     else

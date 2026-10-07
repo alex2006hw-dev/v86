@@ -526,6 +526,18 @@ if(typeof XMLHttpRequest === "undefined" ||
 {
     let fs;
 
+    const get_fs = async function()
+    {
+        // Electron renderers with nodeIntegration have process.versions.node but
+        // a browser module loader, so dynamic import of node: URLs fails. require() works.
+        if(typeof require !== "undefined")
+        {
+            return require("fs")["promises"];
+        }
+        // string concat to work around closure compiler 'Invalid module path "node:fs/promises" for resolution mode'
+        return import("node:" + "fs/promises");
+    };
+
     /**
      * @param {string} filename
      * @param {Object} options
@@ -535,8 +547,7 @@ if(typeof XMLHttpRequest === "undefined" ||
     {
         if(!fs)
         {
-            // string concat to work around closure compiler 'Invalid module path "node:fs/promises" for resolution mode'
-            fs = await import("node:" + "fs/promises");
+            fs = await get_fs();
         }
 
         if(options.range)
@@ -581,8 +592,7 @@ if(typeof XMLHttpRequest === "undefined" ||
     {
         if(!fs)
         {
-            // string concat to work around closure compiler 'Invalid module path "node:fs/promises" for resolution mode'
-            fs = await import("node:" + "fs/promises");
+            fs = await get_fs();
         }
         const stat = await fs["stat"](path);
         return stat.size;
@@ -598,6 +608,14 @@ else
     load_file = async function(filename, options, n_tries)
     {
         var http = new XMLHttpRequest();
+
+        const abort = () => http.abort();
+
+        if(options.signal)
+        {
+            if(options.signal.aborted) return;
+            options.signal.addEventListener("abort", abort, { once: true });
+        }
 
         http.open(options.method || "get", filename, true);
 
@@ -642,6 +660,8 @@ else
 
         http.onload = function(e)
         {
+            if(options.signal) options.signal.removeEventListener("abort", abort);
+
             if(http.readyState === 4)
             {
                 if(http.status !== 200 && http.status !== 206)
@@ -669,6 +689,8 @@ else
 
         http.onerror = function(e)
         {
+            if(options.signal) options.signal.removeEventListener("abort", abort);
+
             console.error("Loading the image " + filename + " failed", e);
             retry();
         };
@@ -727,4 +749,35 @@ export function read_sized_string_from_mem(mem, offset, len)
     offset >>>= 0;
     len >>>= 0;
     return String.fromCharCode(...new Uint8Array(mem.buffer, offset, len));
+}
+
+/**
+ * Unicode mappings of supported 8-bit code pages.
+ * Each mapping is a string of 256 Unicode symbols used as a lookup table for 8-bit character codes.
+ *
+ * Supported mappings and their encoding labels:
+ * - "cp437": CP437 (MS-DOS Latin US), default
+ * - "cp858": CP858 (Western Europe), the lower 128 bytes are identical to CP437
+ * - "ascii": ASCII (7-Bit), same as CP437 with lower 32 and upper 128 bytes mapped to "."
+ *
+ * @type {Object<string, string>}
+ */
+const CHARMAPS =
+{
+    cp437: " ☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼ !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~⌂ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ",
+    cp858: "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜø£Ø×ƒáíóúñÑªº¿®¬½¼¡«»░▒▓│┤ÁÂÀ©╣║╗╝¢¥┐└┴┬├─┼ãÃ╚╔╩╦╠═╬¤ðÐÊËÈ€ÍÎÏ┘┌█▄¦Ì▀ÓßÔÒõÕµþÞÚÛÙýÝ¯´­±‗¾¶§÷¸°¨·¹³²■ "
+};
+
+CHARMAPS.cp858 = CHARMAPS.cp437.slice(0, 128) + CHARMAPS.cp858;
+CHARMAPS.ascii = CHARMAPS.cp437.split("").map((c, i) => i > 31 && i < 128 ? c : ".").join("");
+
+/**
+ * Return charmap for given encoding, default to CP437 if encoding is falsey or not defined in CHARMAPS.
+ *
+ * @param {string} encoding
+ * @return {!string}
+ */
+export function get_charmap(encoding)
+{
+    return encoding && CHARMAPS[encoding] ? CHARMAPS[encoding] : CHARMAPS.cp437;
 }

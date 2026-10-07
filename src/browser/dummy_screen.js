@@ -1,9 +1,11 @@
 import { dbg_assert } from "../log.js";
+import { get_charmap } from "../lib.js";
 
 /**
  * @constructor
+ * @param {Object=} options
  */
-export function DummyScreenAdapter()
+export function DummyScreenAdapter(options)
 {
     var
         graphic_image_data,
@@ -30,7 +32,10 @@ export function DummyScreenAdapter()
         text_mode_width = 0,
 
         // number of rows
-        text_mode_height = 0;
+        text_mode_height = 0,
+
+        // 8-bit-text to Unicode character map
+        charmap = get_charmap(options?.encoding);
 
     this.put_char = function(row, col, chr, blinking, bg_color, fg_color)
     {
@@ -42,6 +47,12 @@ export function DummyScreenAdapter()
     this.destroy = function() {};
     this.pause = function() {};
     this.continue = function() {};
+
+    this.clear_text_state = function()
+    {
+        text_mode_width = null;
+        text_mode_height = null;
+    };
 
     this.set_mode = function(graphical)
     {
@@ -112,10 +123,11 @@ export function DummyScreenAdapter()
         return screen;
     };
 
-    this.get_text_row = function(i)
+    this.get_text_row = function(y)
     {
-        const offset = i * text_mode_width;
-        return String.fromCharCode.apply(String, text_mode_data.subarray(offset, offset + text_mode_width));
+        const begin = y * text_mode_width;
+        const end = begin + text_mode_width;
+        return Array.from(text_mode_data.subarray(begin, end), chr => charmap[chr]).join("");
     };
 
     this.set_size_text(80, 25);

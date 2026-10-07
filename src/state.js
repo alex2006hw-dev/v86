@@ -20,6 +20,7 @@ function StateLoadError(msg)
 StateLoadError.prototype = new Error;
 
 const CONSTRUCTOR_TABLE = {
+    "Map": Map,
     "Uint8Array": Uint8Array,
     "Int8Array": Int8Array,
     "Uint16Array": Uint16Array,
@@ -41,6 +42,17 @@ function save_object(obj, saved_buffers)
     if(Array.isArray(obj))
     {
         return obj.map(x => save_object(x, saved_buffers));
+    }
+
+    if(obj instanceof Map)
+    {
+        return {
+            "__state_type__": "Map",
+            "args": Array.from(obj.entries()).map(([k, v]) => [
+                save_object(k, saved_buffers),
+                save_object(v, saved_buffers),
+            ]),
+        };
     }
 
     if(obj.constructor === Object)
@@ -107,6 +119,10 @@ function restore_buffers(obj, buffers)
 
     const constructor = CONSTRUCTOR_TABLE[type];
     dbg_assert(constructor, "Unkown type: " + type);
+
+    if(obj["args"] !== undefined) {
+        return new constructor(obj["args"]);
+    }
 
     const buffer = buffers[obj["buffer_id"]];
     return new constructor(buffer);
@@ -228,15 +244,15 @@ export function restore_state(cpu, state)
     {
         const ctx = cpu.zstd_create_ctx(state.length);
 
-        new Uint8Array(cpu.wasm_memory.buffer, cpu.zstd_get_src_ptr(ctx), state.length).set(state);
+        new Uint8Array(cpu.wasm_memory.buffer, cpu.zstd_get_src_ptr(ctx) >>> 0, state.length).set(state);
 
         let ptr = cpu.zstd_read(ctx, 16);
-        const header_block = new Uint8Array(cpu.wasm_memory.buffer, ptr, 16);
+        const header_block = new Uint8Array(cpu.wasm_memory.buffer, ptr >>> 0, 16);
         const info_block_len = read_state_header(header_block, false);
         cpu.zstd_read_free(ptr, 16);
 
         ptr = cpu.zstd_read(ctx, info_block_len);
-        const info_block_buffer = new Uint8Array(cpu.wasm_memory.buffer, ptr, info_block_len);
+        const info_block_buffer = new Uint8Array(cpu.wasm_memory.buffer, ptr >>> 0, info_block_len);
         const info_block_obj = read_info_block(info_block_buffer);
         cpu.zstd_read_free(ptr, info_block_len);
 
@@ -253,7 +269,7 @@ export function restore_state(cpu, state)
 
             if(buffer_info.length > CHUNK_SIZE)
             {
-                const ptr = cpu.zstd_read(ctx, front_padding);
+                const ptr = cpu.zstd_read(ctx, front_padding) >>> 0;
                 cpu.zstd_read_free(ptr, front_padding);
 
                 const buffer = new Uint8Array(buffer_info.length);
@@ -267,7 +283,7 @@ export function restore_state(cpu, state)
                     const to_read = Math.min(remaining, CHUNK_SIZE);
 
                     const ptr = cpu.zstd_read(ctx, to_read);
-                    buffer.set(new Uint8Array(cpu.wasm_memory.buffer, ptr, to_read), have);
+                    buffer.set(new Uint8Array(cpu.wasm_memory.buffer, ptr >>> 0, to_read), have);
                     cpu.zstd_read_free(ptr, to_read);
 
                     have += to_read;
@@ -276,7 +292,7 @@ export function restore_state(cpu, state)
             else
             {
                 const ptr = cpu.zstd_read(ctx, front_padding + buffer_info.length);
-                const offset = ptr + front_padding;
+                const offset = (ptr >>> 0) + front_padding;
                 buffers.push(cpu.wasm_memory.buffer.slice(offset, offset + buffer_info.length));
                 cpu.zstd_read_free(ptr, front_padding + buffer_info.length);
             }
