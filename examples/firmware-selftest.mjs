@@ -352,22 +352,34 @@ function assemble(a)
     // immediate stores rather than emitted as data, so the test stays a few
     // dozen bytes and the sector keeps fitting in 512.
     const GDT = 0x0400;
-    const PSEUDO = GDT + 0x18;
+    const PSEUDO = GDT + 0x28;   // past all four descriptors
 
     // null descriptor at GDT+0x00 is already zero -- the scratch segment is
     // cleared by the data-segment setup below.
     // code descriptor at GDT+0x08: base 0, limit 0xFFFFF, G=1, D=1, P=1, ring 0, code
     a.mov_moffs_imm16(GDT + 0x08, 0xFFFF);
     a.mov_moffs_imm16(GDT + 0x0A, 0x0000);
-    a.mov_moffs_imm16(GDT + 0x0C, 0x009A);
+    // Bytes 4 and 5 are Base[23:16] and the access byte, in that order --
+    // not the other way round. Getting this wrong makes every descriptor
+    // non-present and every segment load fault.
+    a.mov_moffs_imm16(GDT + 0x0C, 0x9A00);
     a.mov_moffs_imm16(GDT + 0x0E, 0x00CF);
     // data descriptor at GDT+0x10: same, but data
     a.mov_moffs_imm16(GDT + 0x10, 0xFFFF);
     a.mov_moffs_imm16(GDT + 0x12, 0x0000);
-    a.mov_moffs_imm16(GDT + 0x14, 0x0092);
+    a.mov_moffs_imm16(GDT + 0x14, 0x9200);
     a.mov_moffs_imm16(GDT + 0x16, 0x00CF);
-    // pseudo-descriptor: limit 0x17 (three descriptors minus one), base = GDT
-    a.mov_moffs_imm16(PSEUDO + 0, 0x0017);
+    // A 16-bit code descriptor at selector 0x18, for the way back. Leaving
+    // protected mode requires a far jump to a 16-bit segment *before*
+    // clearing CR0.PE; clearing PE first and then far jumping is not a
+    // sequence real hardware accepts, and it is what made this test fault
+    // for reasons of its own.
+    a.mov_moffs_imm16(GDT + 0x18, 0xFFFF);
+    a.mov_moffs_imm16(GDT + 0x1A, 0x0000);
+    a.mov_moffs_imm16(GDT + 0x1C, 0x9A00);
+    a.mov_moffs_imm16(GDT + 0x1E, 0x0000);
+    // pseudo-descriptor: limit 0x1F (four descriptors minus one), base = GDT
+    a.mov_moffs_imm16(PSEUDO + 0, 0x001F);
     a.mov_moffs_imm16(PSEUDO + 2, GDT & 0xFFFF);
     a.mov_moffs_imm16(PSEUDO + 4, (DATA_SEG >> 12) & 0xFFFF);
 
@@ -379,10 +391,14 @@ function assemble(a)
 
     // Reached only if the far jump and the segment load both worked.
     a.label("pm_ok");
+    // Far jump to the 16-bit descriptor first: that is what flushes CS and
+    // puts us in a state where clearing PE is legal.
+    a.jmp_far_label("pm16", 0x0018);
+    a.label("pm16");
     a.mov_eax_cr0();
     a.and_eax_imm8(0xFE);           // clear CR0.PE
     a.mov_cr0_eax();
-    a.jmpl("after_P");
+    a.jmp_far_label("after_P", 0x0000);
     a.label("after_P");
 
     // ---- M: conventional memory ----------------------------------------
