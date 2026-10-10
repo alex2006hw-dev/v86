@@ -28,7 +28,8 @@ that reports success to a Windows 95 installer is worse than an honest
 | ID | Area | Status | Severity |
 |---|---|---|---|
 | **CD-2** | **`INT 13h AX=4B00h/4B02h` absent** — POST boots from CD, a loader cannot | Absent | Medium |
-| **BOOT-1** | **Debian/NetBSD installers do not complete boot, under any BIOS** | Broken | High |
+| **BOOT-1** | Debian/NetBSD installers do not complete boot, under any BIOS | Broken | High |
+| **BOOT-2** | **32-bit protected-mode guests fault at boot handoff; SeaBIOS boots them** | Broken | **High** |
 | **CD-3** | El Torito `terminate emulation` is a no-op | Stub | Medium |
 | **CD-4** | No ATAPI `IDENTIFY` (`INT 15h AX=4F06h`) | Absent | Medium |
 | **CD-5** | El Torito boot catalog not in the boot-config table | Absent | Low |
@@ -355,6 +356,56 @@ so this is at least not the same problem twice.
 
 **Done when:** `debian-12.1.0-i386-netinst.iso` reaches an installer menu,
 with SeaBIOS and the built-in firmware behaving the same.
+
+### BOOT-2 — Protected-mode guests fault at the boot handoff
+
+**Status:** Broken. **Severity:** High.
+
+Two 32-bit El Torito images, both from v86's own Advent calendar — the page
+publishes only images that "are 32-bit x86 and work in v86" — boot to
+different places:
+
+| Image | Size | El Torito | SeaBIOS | built-in firmware |
+|---|---|---|---|---|
+| `FreeNOS-1.0.3.iso` | 10.5 MiB | no-emulation, 4 sectors from LBA 3800 | **reaches `login:`** | **panics** |
+| `HelenOS-0.11.2-ia32.iso` | 24.6 MiB | no-emulation, 56 sectors from LBA 64 | boots | **panics** |
+
+Both panic identically:
+
+```
+Unimplemented: #GP handler                       (src/rust/cpu/cpu.rs:856)
+  call_interrupt_vector -> trigger_gp -> switch_seg -> instr32_07
+```
+
+`instr32_07` is `POP ES` in 32-bit mode, so the guest has entered protected
+mode and a segment load is being rejected.
+
+**This is a firmware gap, not a v86 limitation** — which is the opposite of
+what BOOT-1 turned out to be, and the reason the oracle exists. SeaBIOS boots
+the same image in the same emulator to a login prompt.
+
+What is ruled out, each checked rather than assumed:
+
+- **Not the CD path.** Attaching FreeNOS as `hda` via its hybrid MBR panics
+  identically, so it is the boot handoff rather than CD reading.
+- **Not I/O.** Every read the firmware makes succeeds, and the trace shows it
+  reading LBA 16 (PVD), 17 (boot record), 46 (catalogue) and 3800 (the boot
+  image), after which the guest issues its own 16 KiB reads. The bytes
+  written to `0000:7C00` match the ISO.
+- **Not A20.** v86 does not implement A20 masking at all (`src/ps2.js:705`
+  says where it would go), so memory is flat either way.
+
+One real defect was found and fixed on the way: the handoff ran with
+interrupts disabled, because a software `int 0x19` clears IF in the CPU core
+and nothing re-enabled it. Every real BIOS enables interrupts before
+transferring control. That fix is correct but did **not** resolve this.
+
+Not yet diagnosed. The remaining differences between this handoff and
+SeaBIOS's are the GDT/IDT state, the memory map handed over through
+`INT 15h AX=E820h`, and general register contents.
+
+**Done when:** FreeNOS reaches its `login:` prompt on the built-in firmware,
+with SeaBIOS as the oracle for the same image.
 
 ### TEST-1 — The boot test is green, but nothing runs it
 

@@ -456,7 +456,38 @@ than assumed:
 Debian's early boot loader reaches a state v86 does not carry it past, under
 any BIOS. Filed as **BOOT-1** in `TechDebt.md`.
 
-### 11.6 New examples and tooling
+### 11.6 Testing against real 32-bit images
+
+The self-test ISO proves the CD path works, but it is a boot sector that
+prints and halts. To test against something real, two images were taken from
+v86's own Advent calendar, which publishes only images that "are 32-bit x86
+and work in v86":
+
+| Image | Size | El Torito |
+|---|---|---|
+| [`FreeNOS-1.0.3.iso`](https://i.copy.sh/FreeNOS-1.0.3.iso) | 10.5 MiB | no-emulation, 4 sectors from LBA 3800, catalogue at LBA 46 |
+| [`HelenOS-0.11.2-ia32.iso`](https://i.copy.sh/HelenOS-0.11.2-ia32.iso) | 24.6 MiB | no-emulation, 56 sectors from LBA 64, catalogue at LBA 63 |
+
+Both have the catalogue LBA at offset `0x47`, which is what the firmware
+reads, and both parse correctly.
+
+| | SeaBIOS | built-in firmware |
+|---|---|---|
+| FreeNOS | **reaches `login:`** | panics: `Unimplemented: #GP handler` on `POP ES` |
+| HelenOS | boots | panics, identically |
+
+So the firmware's CD path is sound, and there is a **separate, real defect at
+the boot handoff** for protected-mode guests — recorded as **BOOT-2** in
+`TechDebt.md`, with what has been ruled out (the CD path, host I/O, and A20)
+and what has not.
+
+That defect turned out to be real hardware handoff state: the bootstrap runs
+through a software `int 0x19`, which clears IF in the CPU core, and nothing
+re-enabled it, so the loader started with interrupts off. Enabling them at
+the handoff is correct and matches what SeaBIOS does, but it did not resolve
+BOOT-2.
+
+### 11.7 New examples and tooling
 
 | | |
 |---|---|

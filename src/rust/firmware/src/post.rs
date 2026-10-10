@@ -462,6 +462,9 @@ fn boot_from_cd<M: Machine>(fw: &mut Firmware<M>) -> bool {
             fw.machine.write_reg(crate::machine::Reg::Edi, 0);
             fw.machine.write_seg(SegReg::Cs, load_seg);
             fw.machine.write_ip(0);
+            // As for the disk path: the bootstrap ran through a software
+            // `int 0x19`, which clears IF. Hand over with them enabled.
+            fw.machine.write_flag(crate::machine::Flag::If, true);
             fw.set_cf(false);
             true
         }
@@ -574,5 +577,9 @@ fn load_and_jump<M: Machine>(fw: &mut Firmware<M>, sector: &[u8; 512], drive: u8
     // so writing IP before CS would compute the offset against the old one.
     fw.machine.write_seg(SegReg::Cs, 0x07C0);
     fw.machine.write_ip(0);
+    // Hand over with interrupts enabled. The bootstrap is reached through
+    // `int 0x19`, and a software interrupt clears IF in the CPU core, so
+    // without this the loader starts with interrupts off and stays off.
+    fw.machine.write_flag(crate::machine::Flag::If, true);
     fw.set_cf(false);
 }

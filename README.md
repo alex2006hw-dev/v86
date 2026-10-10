@@ -115,11 +115,20 @@ new V86({ firmware: "pcjs", cdrom: { url: "debian.iso" } });   // El Torito
 new V86({ firmware: "pcjs", hda:   { url: "disk.img" } });     // MBR
 ```
 
-El Torito boot works, including no-emulation images. Debian's installer and
-NetBSD's are **not** fully working: the firmware reads their catalogues and
-loads their boot images correctly, but their loaders then stall — and they
-stall identically under SeaBIOS, so this is a v86 limitation rather than a
-firmware one. See BOOT-1 in [`TechDebt.md`](TechDebt.md).
+El Torito boot works, including no-emulation images. Two 32-bit images known
+to work in v86 are useful test subjects, both from
+[v86's Advent calendar](https://copy.sh/v86/advent/2023/):
+
+```console
+$ curl -O https://i.copy.sh/FreeNOS-1.0.3.iso        # 10.5 MiB, no-emulation
+$ curl -O https://i.copy.sh/HelenOS-0.11.2-ia32.iso  # 24.6 MiB, ia32
+$ FW_DEVICE=cdrom node examples/cd-boot.js FreeNOS-1.0.3.iso
+```
+
+FreeNOS reaches its `login:` prompt under SeaBIOS but **panics under the
+built-in firmware** — a real defect at the boot handoff for protected-mode
+guests, not a CD problem (BOOT-2 in [`TechDebt.md`](TechDebt.md)). Debian's
+and NetBSD's installers do not complete boot under either BIOS (BOOT-1).
 
 ### What is not finished
 
