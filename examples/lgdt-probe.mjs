@@ -8,16 +8,13 @@
 // the host can find it -- with a sentinel afterwards to prove it actually got
 // there. No firmware, no boot loader, no protected mode.
 //
-// The answer is no:
-//
-//   gdtr limit = 0x0   (asked for 0x1F)
-//   gdtr base  = 0x0   (asked for 0x0400)
-//   sentinel at 0x820 = 0xbeef  (probe reached the sgdt)
-//
-// Identical under SeaBIOS, so this is a property of the emulator rather than
-// of any BIOS. Every protected-mode boot loader installs a GDT, so this is
-// the leading suspect for BOOT-2 -- see TechDebt.md.
-//
+// The answer is yes -- but it took a fix to get here.
+// The ModRM byte for a [disp16] operand is rm=110; rm=101
+// is [DI], which made an earlier version of this probe read
+// its pseudo-descriptor from DI*16 and report the GDT as
+// lost. That failure was silent, which is the point of
+// keeping the probe: it pins the encoding down.
+
 // `lgdt` raises #GP only when CPL is non-zero, and returns silently on a
 // page fault, so "GDTR is still zero afterwards" means the store never
 // happened rather than that something clobbered it.

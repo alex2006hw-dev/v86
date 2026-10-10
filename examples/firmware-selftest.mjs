@@ -79,6 +79,11 @@ export class Asm
         this.pos = 0;
         this.labels = new Map();
         this.fixups = [];
+        // Where the sector is loaded. Far jumps in protected mode
+        // carry an absolute offset, because the segment base is
+        // whatever the descriptor says -- usually zero -- so the
+        // offset has to include the load address.
+        this.origin = 0;
     }
 
     label(name)
@@ -152,6 +157,24 @@ export class Asm
                 const rel = target - (f.at + 2);
                 this.buf[f.at] = rel & 0xFF;
                 this.buf[f.at + 1] = (rel >> 8) & 0xFF;
+            }
+            else if(f.kind === "far_rel")
+            {
+                // A far jump back to real mode. The selector
+                // names the segment the code was loaded into,
+                // so the offset stays relative to it.
+                const target = this.labels.get(f.name);
+                this.buf[f.at] = target & 0xFF;
+                this.buf[f.at + 1] = (target >> 8) & 0xFF;
+            }
+            else if(f.kind === "far")
+            {
+                // A far jump in protected mode: the descriptor's
+                // base is added by the CPU, not by us, so the
+                // offset must be the absolute address.
+                const target = this.labels.get(f.name) + this.origin;
+                this.buf[f.at] = target & 0xFF;
+                this.buf[f.at + 1] = (target >> 8) & 0xFF;
             }
             else if(f.kind === "absolute")
             {
@@ -241,28 +264,59 @@ export class Asm
     // ---- protected-mode / control-register forms ----
     mov_eax_cr0()   { return this.b(0x0F, 0x20, 0xC0); }
     mov_cr0_eax()   { return this.b(0x0F, 0x22, 0xC0); }
+    // 83 /reg ib: /0=ADD /1=OR /4=AND /5=SUB. The reg field is
+    // bits 5..3 of the ModRM byte, so AND is 11 100 000 = 0xE0.
+    // 0xE8 would be SUB, which adds instead of masking.
     or_eax_imm8(v)  { return this.b(0x83, 0xC8, v); }
-    and_eax_imm8(v) { return this.b(0x83, 0xE8, v); }
-    // 0F 01 /2 is LGDT. With a disp16 operand the ModRM byte is
-    // mod=00, reg=010, rm=101 -- which is 0x15. 0x10 would be reg=010 with
-    // rm=000, a [BX] operand with a disp8, and would silently decode as
-    // something else entirely.
-    lgdt_moffs(d)   { return this.b(0x0F, 0x01, 0x15).w(d); }
+    and_eax_imm8(v) { return this.b(0x83, 0xE0, v); }
+    // 0F 01 /2 is LGDT. The r/m field selects the addressing mode, and
+    // [disp16] is r/m=110 -- so the ModRM byte is mod=00, reg=010, rm=110,
+    // which is 0x16.
+    //
+    // Getting this wrong is silent and confusing: rm=101 is [DI], so
+    // `0F 01 15 xx xx` reads the pseudo-descriptor from DI*16 instead of
+    // from the displacement, and `0F 01 10 xx xx` is [BX] with a disp8.
+    lgdt_moffs(d)   { return this.b(0x0F, 0x01, 0x16).w(d); }
 
-    // 0F 01 /0 is SGDT and /1 is SIDT, with a disp16 operand when ModRM is
-    // mod=00, reg=N, rm=101. The CS-relative forms (segment override 0x2E)
-    // address the boot sector's own segment.
-    sgdt_cs(d)      { return this.b(0x2E, 0x0F, 0x01, 0x05).w(d); }
-    sidt_moffs(d)   { return this.b(0x0F, 0x01, 0x0D).w(d); }
-    sgdt_moffs(d)   { return this.b(0x0F, 0x01, 0x05).w(d); }
-    sidt_cs(d)      { return this.b(0x2E, 0x0F, 0x01, 0x0D).w(d); }
+    // 0F 01 /0 is SGDT and /1 is SIDT, and they use the same r/m=110 for
+    // [disp16], so ModRM 0x06 and 0x0E. The 0x2E forms carry a CS segment
+    // override, addressing the boot sector's own segment.
+    sgdt_cs(d)      { return this.b(0x2E, 0x0F, 0x01, 0x06).w(d); }
+    sidt_cs(d)      { return this.b(0x2E, 0x0F, 0x01, 0x0E).w(d); }
+    sidt_moffs(d)   { return this.b(0x0F, 0x01, 0x0E).w(d); }
+    sgdt_moffs(d)   { return this.b(0x0F, 0x01, 0x06).w(d); }
     jmp_far(off, sel) { return this.b(0xEA).w(off).w(sel); }
+
+    /** Where this code will be loaded, for absolute offsets. */
+    set_origin(o) { this.origin = o; return this; }
 
     /** `jmp <label>:<sel>` -- the offset is a label address. */
     jmp_far_label(name, sel) {
-        this.fixups.push({ at: this.pos + 1, name, kind: "absolute" });
+        this.fixups.push({ at: this.pos + 1, name, kind: "far" });
         return this.b(0xEA).w(0).w(sel);
     }
+
+    /**
+     * The same, forced to 16-bit operands. In 32-bit code the
+     * plain form reads a 32-bit offset and a 16-bit selector,
+     * so a far jump written as five bytes would swallow the
+     * following instruction as part of its operand.
+     */
+    jmp_far_label16(name, sel) {
+        this.fixups.push({ at: this.pos + 2, name, kind: "far" });
+        return this.b(0x66, 0xEA).w(0).w(sel);
+    }
+    /**
+     * A far jump back to real mode, where the selector names
+     * the segment the sector was loaded into. The offset is
+     * relative to that segment, unlike the protected-mode
+     * form, whose descriptors have a base of zero.
+     */
+    jmp_far_label_rel(name, sel) {
+        this.fixups.push({ at: this.pos + 1, name, kind: "far_rel" });
+        return this.b(0xEA).w(0).w(sel);
+    }
+
     push_imm32(v)   { return this.b(0x68).w(v); }
     pop_es()        { return this.b(0x1F); }
 
@@ -390,6 +444,9 @@ function assemble(a)
     a.mov_moffs_imm16(PSEUDO + 4, (DATA_SEG >> 12) & 0xFFFF);
 
     a.lgdt_moffs(PSEUDO);
+    // The descriptors all have base zero, so from here on an
+    // offset is an absolute address: the code lives at 0x7C00.
+    a.set_origin(0x7C00);
     a.mov_eax_cr0();
     a.or_eax_imm8(0x01);            // CR0.PE
     a.mov_cr0_eax();
@@ -398,13 +455,20 @@ function assemble(a)
     // Reached only if the far jump and the segment load both worked.
     a.label("pm_ok");
     // Far jump to the 16-bit descriptor first: that is what flushes CS and
-    // puts us in a state where clearing PE is legal.
-    a.jmp_far_label("pm16", 0x0018);
+    // puts us in a state where clearing PE is legal. The 16-bit form is
+    // required here, because this code is 32-bit and a plain far jump
+    // would read a 32-bit offset.
+    a.jmp_far_label16("pm16", 0x0018);
     a.label("pm16");
     a.mov_eax_cr0();
     a.and_eax_imm8(0xFE);           // clear CR0.PE
     a.mov_cr0_eax();
-    a.jmp_far_label("after_P", 0x0000);
+    // Back to real mode, into the segment the sector was
+    // loaded into. Jumping to selector zero would leave CS
+    // naming 0000:0000, and the verdict printer copies CS
+    // into DS to find its strings -- it would then read
+    // through the wrong segment and print nothing.
+    a.jmp_far_label_rel("after_P", 0x07C0);
     a.label("after_P");
 
     // ---- M: conventional memory ----------------------------------------

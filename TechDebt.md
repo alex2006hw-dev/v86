@@ -483,49 +483,60 @@ Reverting it (leaving the loader with interrupts disabled) changes nothing —
 still `cpu.rs:856`. That change stays; it matches SeaBIOS and is correct,
 but it is unrelated to this failure.
 
-### A guest cannot install a GDT
+### The reproducer, and what it turned out to be
 
 `examples/lgdt-probe.mjs` is a twenty-line boot sector that writes a
-pseudo-descriptor, executes `LGDT`, reads it straight back with `SGDT`, and
-parks the result where the host can read it, with a sentinel afterwards to
-prove it got there:
+pseudo-descriptor, executes `LGDT`, reads it straight back with
+`SGDT`, and parks the result where the host can read it, with a
+sentinel afterwards to prove it got there:
 
 ```
-  gdtr limit = 0x0   (asked for 0x1F)
-  gdtr base  = 0x0   (asked for 0x0400)
+  gdtr limit = 0x1f   (asked for 0x1F)
+  gdtr base  = 0x400  (asked for 0x0400)
   sentinel at 0x820 = 0xbeef  (probe reached the sgdt)
+  RESULT: lgdt/sgdt round-trip OK
 ```
 
-**`LGDT` does not store the GDT.** Identical under SeaBIOS, so it is a
-property of the emulator and not of any BIOS — which also means it cannot be
-explained by the boot handoff.
+`LGDT` stores the GDT correctly. The earlier reading -- that v86
+dropped it -- was a bug in the probe: the ModRM byte for a `[disp16]`
+operand is `rm=110`, and `rm=101` is `[DI]`, so the probe was
+reading its pseudo-descriptor from `DI*16`. That is worth knowing,
+because it is silent: nothing reports it, and the wrong address is
+used without complaint.
 
-`lgdt` raises `#GP` only when CPL is non-zero, and returns silently on a
-page fault, so a GDTR that is still zero afterwards means the store never
-happened rather than that something clobbered it. With `reset_cpu` setting
-`*cpl = 0`, neither path should be taken.
+With that fixed, the protected-mode reproducer in
+`examples/firmware-selftest.mjs` runs the whole sequence and returns
+to real mode, and the self-test passes end to end:
 
-Every protected-mode boot loader installs a GDT, so this is the strongest
-candidate yet for BOOT-2. It does not yet explain why FreeNOS boots under
-SeaBIOS: the loader must be reaching protected mode by some route that does
-not go through `LGDT` while CPL is whatever it is here.
+```
+  PASS: the built-in firmware booted from floppy and served every
+        BIOS service
+```
 
-**Done when:** the probe reports a GDTR matching what it loaded, under both
-BIOSes.
+Getting there took seven separate fixes, all in the reproducer:
 
-### The next experiment
+  * the GDT access byte is byte 5 of a descriptor, not byte 4;
+  * the pseudo-descriptor overlapped the fourth descriptor;
+  * `LGDT`/`SGDT` used `rm=101` (`[DI]`) instead of `rm=110`
+    (`[disp16]`);
+  * `and eax, imm8` was encoded as `SUB` (`83 /5`) instead of `AND`
+    (`83 /4`), so it *set* `CR0.PE` instead of clearing it;
+  * far jumps carried sector-relative offsets, but the descriptors
+    have a base of zero, so the offset has to be absolute;
+  * a far jump in 32-bit code reads a 32-bit offset unless it
+    carries the `0x66` operand-size prefix;
+  * the return to real mode jumped to selector `0x0000`, which left
+    `CS` naming `0000:0000` and broke the verdict printer's
+    `mov ds, cs`.
 
-Fix the reproducer: give the GDT a 16-bit code descriptor, far jump to it,
-*then* clear `CR0.PE`, and pop the segment registers on the way back. If it
-then passes under both BIOSes, the protected-mode entry is sound and
-BOOT-2 is about something FreeNOS specifically needs. If it still faults,
-the faulting instruction will finally be identifiable, because the IDT
-absence will no longer be masking it.
+**So the protected-mode entry is sound under this firmware.** The
+reproducer no longer reproduces BOOT-2, which means BOOT-2 is about
+something a real boot loader does beyond this sequence -- not about
+entering protected mode, installing a GDT, or the handoff state, all
+of which have now been measured.
 
-A second, cheaper change is worth making regardless: **install a GDT and an
-IDT at handoff.** `OvmfPkg/Library/LoadLinuxLib/LinuxGdt.c` does exactly
-this for a protected-mode kernel, and without an IDT every protected-mode
-fault is an emulator panic with no diagnostic.
+**Done when:** FreeNOS boots to its prompt under the built-in
+firmware.
 
 ### Reference material
 
