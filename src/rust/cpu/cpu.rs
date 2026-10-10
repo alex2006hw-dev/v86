@@ -801,6 +801,14 @@ pub unsafe fn call_interrupt_vector(
     is_software_int: bool,
     error_code: Option<i32>,
 ) {
+    // Firmware hook: in real mode, if the IVT entry points into
+    // the firmware marker area, dispatch to the firmware.
+    if !*protected_mode && is_software_int {
+        if crate::fw_adapter::try_firmware_interrupt(interrupt_nr as u8) {
+            return;
+        }
+    }
+
     if *protected_mode {
         if vm86_mode() && *cr.offset(4) & CR4_VME != 0 {
             panic!("Unimplemented: VME");
@@ -1916,6 +1924,27 @@ pub unsafe fn get_eflags() -> i32 {
         | (getzf() as i32) << 6
         | (getsf() as i32) << 7
         | (getof() as i32) << 11;
+}
+
+#[no_mangle]
+pub unsafe fn set_eflags(eflags: i32) {
+    *flags = eflags & !FLAGS_ALL;
+    setcf((eflags & 1) != 0);
+    setpf((eflags & 4) != 0);
+    setaf((eflags & 16) != 0);
+    setzf((eflags & 64) != 0);
+    setsf((eflags & 128) != 0);
+    setof((eflags & 2048) != 0);
+}
+
+#[no_mangle]
+pub unsafe fn get_instruction_pointer() -> i32 {
+    *instruction_pointer as i32
+}
+
+#[no_mangle]
+pub unsafe fn set_instruction_pointer(eip: i32) {
+    *instruction_pointer = eip as u32;
 }
 
 pub unsafe fn readable_or_pagefault(addr: i32, size: i32) -> OrPageFault<()> {
@@ -4669,6 +4698,9 @@ pub unsafe fn check_page_switch(block_addr: u32, next_block_addr: u32) {
 
 #[no_mangle]
 pub unsafe fn reset_cpu() {
+    // Firmware hook: run POST on reset.
+    crate::fw_adapter::run_firmware_post();
+
     for i in 0..8 {
         *segment_is_null.offset(i) = false;
         *segment_limits.offset(i) = 0;

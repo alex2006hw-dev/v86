@@ -1,0 +1,12 @@
+[package]
+name = "v86-firmware"
+version = "0.1.0"
+edition = "2021"
+description = "Permissively-licensed (MIT) PC/XT/AT BIOS firmware for the v86 emulator. PCjs-derived services plus modern features (INT 13h EDD/LBA, El Torito, VBE 2.0+) implemented from public specifications."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.test]
+opt-level = 1

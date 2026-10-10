@@ -5,6 +5,8 @@ mod dbg;
 mod paging;
 
 pub mod cpu;
+pub mod fw_adapter;
+pub mod fw_adapter;
 
 pub mod js_api;
 pub mod profiler;

@@ -1,0 +1,4 @@
+review this implementation of x86 32 bits emulation in javascript and create a
+todo.md list to perform a clean room re-implemtation using rust to wasm to
+migrate the code from gpl2.0 to MIT without infrigment for public license
+release
