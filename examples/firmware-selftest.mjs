@@ -243,12 +243,18 @@ export class Asm
     mov_cr0_eax()   { return this.b(0x0F, 0x22, 0xC0); }
     or_eax_imm8(v)  { return this.b(0x83, 0xC8, v); }
     and_eax_imm8(v) { return this.b(0x83, 0xE8, v); }
-    lgdt_moffs(d)   { return this.b(0x0F, 0x01, 0x10).w(d); }   // lgdt [d]
+    // 0F 01 /2 is LGDT. With a disp16 operand the ModRM byte is
+    // mod=00, reg=010, rm=101 -- which is 0x15. 0x10 would be reg=010 with
+    // rm=000, a [BX] operand with a disp8, and would silently decode as
+    // something else entirely.
+    lgdt_moffs(d)   { return this.b(0x0F, 0x01, 0x15).w(d); }
 
     // 0F 01 /0 is SGDT and /1 is SIDT, with a disp16 operand when ModRM is
     // mod=00, reg=N, rm=101. The CS-relative forms (segment override 0x2E)
     // address the boot sector's own segment.
     sgdt_cs(d)      { return this.b(0x2E, 0x0F, 0x01, 0x05).w(d); }
+    sidt_moffs(d)   { return this.b(0x0F, 0x01, 0x0D).w(d); }
+    sgdt_moffs(d)   { return this.b(0x0F, 0x01, 0x05).w(d); }
     sidt_cs(d)      { return this.b(0x2E, 0x0F, 0x01, 0x0D).w(d); }
     jmp_far(off, sel) { return this.b(0xEA).w(off).w(sel); }
 

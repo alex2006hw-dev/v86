@@ -483,6 +483,36 @@ Reverting it (leaving the loader with interrupts disabled) changes nothing —
 still `cpu.rs:856`. That change stays; it matches SeaBIOS and is correct,
 but it is unrelated to this failure.
 
+### A guest cannot install a GDT
+
+`examples/lgdt-probe.mjs` is a twenty-line boot sector that writes a
+pseudo-descriptor, executes `LGDT`, reads it straight back with `SGDT`, and
+parks the result where the host can read it, with a sentinel afterwards to
+prove it got there:
+
+```
+  gdtr limit = 0x0   (asked for 0x1F)
+  gdtr base  = 0x0   (asked for 0x0400)
+  sentinel at 0x820 = 0xbeef  (probe reached the sgdt)
+```
+
+**`LGDT` does not store the GDT.** Identical under SeaBIOS, so it is a
+property of the emulator and not of any BIOS — which also means it cannot be
+explained by the boot handoff.
+
+`lgdt` raises `#GP` only when CPL is non-zero, and returns silently on a
+page fault, so a GDTR that is still zero afterwards means the store never
+happened rather than that something clobbered it. With `reset_cpu` setting
+`*cpl = 0`, neither path should be taken.
+
+Every protected-mode boot loader installs a GDT, so this is the strongest
+candidate yet for BOOT-2. It does not yet explain why FreeNOS boots under
+SeaBIOS: the loader must be reaching protected mode by some route that does
+not go through `LGDT` while CPL is whatever it is here.
+
+**Done when:** the probe reports a GDTR matching what it loaded, under both
+BIOSes.
+
 ### The next experiment
 
 Fix the reproducer: give the GDT a 16-bit code descriptor, far jump to it,
