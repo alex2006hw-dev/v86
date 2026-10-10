@@ -801,10 +801,24 @@ pub unsafe fn call_interrupt_vector(
     is_software_int: bool,
     error_code: Option<i32>,
 ) {
-    // Firmware hook: in real mode, if the IVT entry points into
-    // the firmware marker area, dispatch to the firmware.
-    if !*protected_mode && is_software_int {
-        if crate::fw_adapter::try_firmware_interrupt(interrupt_nr as u8) {
+    // Firmware trap. The ROM stubs execute `int <TRAP_VECTOR>` with a
+    // service id on the stack; the trap is honoured only when the return
+    // address is inside one of the firmware's own ROM windows, so guests
+    // are free to use that vector themselves. See src/rust/firmware/src/rom.rs.
+    if !*protected_mode && is_software_int && interrupt_nr as u8 == crate::fw_adapter::TRAP_VECTOR
+    {
+        // In real mode `instruction_pointer` is the physical address of the
+        // next instruction, which is exactly the return address the INT
+        // would have pushed.
+        //
+        // Both conditions are required. The ROM window alone is not enough:
+        // SeaBIOS and the Bochs BIOS occupy the same addresses, so without
+        // the installed-firmware check an `int 0x66` in a third-party ROM
+        // would be swallowed here instead of dispatched through the IVT.
+        if crate::fw_adapter::firmware_is_installed()
+            && crate::fw_adapter::is_firmware_rom(*instruction_pointer as u32)
+        {
+            crate::fw_adapter::firmware_trap();
             return;
         }
     }
@@ -1926,15 +1940,22 @@ pub unsafe fn get_eflags() -> i32 {
         | (getof() as i32) << 11;
 }
 
+/// Write EFLAGS from an integer.
+///
+/// Condition codes in this CPU are computed lazily: `flags_changed`
+/// names the codes that must be recomputed from `last_op1`/`last_result`
+/// rather than read from `flags`. Storing a new EFLAGS therefore has to
+/// clear those bits as well, or the next `getcf()` would overwrite what
+/// was just written with a stale pending result.
 #[no_mangle]
 pub unsafe fn set_eflags(eflags: i32) {
+    *flags_changed &= !FLAGS_ALL;
     *flags = eflags & !FLAGS_ALL;
-    setcf((eflags & 1) != 0);
-    setpf((eflags & 4) != 0);
-    setaf((eflags & 16) != 0);
-    setzf((eflags & 64) != 0);
-    setsf((eflags & 128) != 0);
-    setof((eflags & 2048) != 0);
+}
+
+/// Read the condition-code bits of EFLAGS, forcing the lazy ones.
+pub unsafe fn get_cc_flags() -> i32 {
+    get_eflags() & FLAGS_ALL
 }
 
 #[no_mangle]
@@ -1944,7 +1965,7 @@ pub unsafe fn get_instruction_pointer() -> i32 {
 
 #[no_mangle]
 pub unsafe fn set_instruction_pointer(eip: i32) {
-    *instruction_pointer = eip as u32;
+    *instruction_pointer = eip;
 }
 
 pub unsafe fn readable_or_pagefault(addr: i32, size: i32) -> OrPageFault<()> {
@@ -4698,9 +4719,6 @@ pub unsafe fn check_page_switch(block_addr: u32, next_block_addr: u32) {
 
 #[no_mangle]
 pub unsafe fn reset_cpu() {
-    // Firmware hook: run POST on reset.
-    crate::fw_adapter::run_firmware_post();
-
     for i in 0..8 {
         *segment_is_null.offset(i) = false;
         *segment_limits.offset(i) = 0;

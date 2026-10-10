@@ -1,43 +1,223 @@
-//! POST (Power-On Self Test) and INT 19h bootstrap.
+//! ROM installation, POST state, and the INT 19h bootstrap.
 //!
-//! POST initializes the BDA, registers drives, parses El Torito
-//! boot catalogs, installs firmware IVT markers, and then runs
-//! the INT 19h bootstrap loader.
+//! Two different things happen at power-on and it is worth keeping them
+//! apart:
+//!
+//! * [`install_roms`] runs once, from the host, before the CPU leaves
+//!   reset. It copies the ROM images into guest memory and points the
+//!   real IVT at the ROM stubs. The CPU is not executing yet, so this
+//!   can be as direct as it likes.
+//! * [`run_post`] runs from inside the ROM, on the ROM stub's own
+//!   stack, after the CPU has entered at `F000:0000`. It builds the
+//!   BIOS Data Area and the memory map, and installs the vectors whose
+//!   targets are only known once the machine configuration is.
+//!
+//! Anything that has to happen before the first instruction executes
+//! belongs in the first; anything that must observe real-mode CPU state
+//! belongs in the second.
 
 use crate::backend::{BlockBackend, DriveKind};
 use crate::bda;
+use crate::debug::tag;
 use crate::eltorito::{self, BootInfo, ElToritoError};
 
 use crate::ivt;
 use crate::machine::{Machine, SegReg};
+use crate::rom;
 use crate::status;
 use crate::Firmware;
 
-/// Run POST: initialize the machine firmware state.
-pub fn run_post<M: Machine>(fw: &mut Firmware<M>) {
-    // 1. Zero the IVT (the CPU starts with garbage vectors).
-    ivt::clear_ivt(&mut fw.machine);
+/// Copy the ROM images into guest memory and point the IVT at them.
+///
+/// Runs from the host with the CPU held in reset, so it uses plain
+/// memory writes rather than anything that depends on register state.
+pub fn install_roms<M: Machine>(fw: &mut Firmware<M>) {
+    let system = rom::build_system_rom();
+    let vga = rom::build_vga_rom();
 
-    // 2. Initialize the BDA.
+    for (i, b) in system.image.iter().enumerate() {
+        fw.machine.write_u8(rom::SYSTEM_ROM_BASE + i as u32, *b);
+    }
+    for (i, b) in vga.image.iter().enumerate() {
+        fw.machine.write_u8(rom::VGA_ROM_BASE + i as u32, *b);
+    }
+
+    // Point every vector that has a stub at its real ROM entry.
+    for vector in 0u16..=0xFF {
+        if let Some(off) = system.layout.stub(vector as u8) {
+            ivt::write_vector(&mut fw.machine, vector as u8, rom::SYSTEM_ROM_SEG, off);
+        }
+    }
+    // The video ROM owns INT 10h, so its stub wins over the system one.
+    ivt::write_vector(&mut fw.machine, 0x10, rom::VGA_ROM_SEG, vga.layout.int10);
+    ivt::write_vector(&mut fw.machine, 0x43, rom::VGA_ROM_SEG, vga.layout.int43);
+    ivt::write_vector(&mut fw.machine, 0x1A, rom::VGA_ROM_SEG, vga.layout.int1a);
+
+    // INT 1Ah AH=4Fh is the conventional way to find the VBE
+    // information block, so the vector must reach the video ROM.
+    bda::write_ivt_entry(&mut fw.machine, 0x43, rom::VGA_ROM_SEG, vga.layout.font);
+
+    fw.roms = Some(system.layout);
+    fw.vga_rom = Some(vga.layout);
+}
+
+/// Run POST from inside the ROM.
+pub fn run_post<M: Machine>(fw: &mut Firmware<M>) {
+    fw.trace(tag::POST, "POST begin");
+    // 1. Zero the IVT. POST owns every vector it does not hand back, and
+    //    the CPU may have been reset with stale ones in place. Vectors
+    //    that survive are the exception timer (0x1C) and the ones the
+    //    video ROM already published.
+    let published = [
+        (0x10u8, rom::VGA_ROM_SEG),
+        (0x1Au8, rom::VGA_ROM_SEG),
+        (0x43u8, rom::VGA_ROM_SEG),
+    ];
+    for v in 0u8..=0xFF {
+        if !published.iter().any(|(vec, _)| *vec == v) {
+            ivt::write_vector(&mut fw.machine, v, 0, 0);
+        }
+    }
+
+    // 2. Re-install the vectors we own, now that the IVT is clean.
+    if let Some(layout) = fw.roms.clone() {
+        for v in 0u8..=0xFF {
+            if let Some(off) = layout.stub(v) {
+                // INT 10h/43h/1Ah belong to the video option ROM.
+                if v == 0x10 || v == 0x1A || v == 0x43 {
+                    continue;
+                }
+                ivt::write_vector(&mut fw.machine, v, rom::SYSTEM_ROM_SEG, off);
+            }
+        }
+    }
+    if let Some(vga) = fw.vga_rom {
+        ivt::write_vector(&mut fw.machine, 0x10, rom::VGA_ROM_SEG, vga.int10);
+        ivt::write_vector(&mut fw.machine, 0x43, rom::VGA_ROM_SEG, vga.font);
+        ivt::write_vector(&mut fw.machine, 0x1A, rom::VGA_ROM_SEG, vga.int1a);
+    }
+
+    // 3. Initialize the BDA.
     init_bda(fw);
 
-    // 3. Build the E820 memory map.
+    // 4. Build the E820 memory map.
     build_e820(fw);
 
-    // 4. Install firmware IVT markers for all service vectors.
-    install_firmware_vectors(fw);
-
-    // 5. Set up the video state.
-    fw.video.mode = 0x03; // 80x25 color text
+    // 5. Set up the video state. This has to happen before anything
+    //    prints: the POST banner writes through the text page.
+    fw.video.mode = 0x03; // 80x25 colour text
     fw.video.cols = 80;
     fw.video.rows = 25;
     fw.video.page = 0;
     bda::set_crt_mode(&mut fw.machine, 0x03);
     bda::set_crt_cols(&mut fw.machine, 80);
-    bda::write_ivt_entry(&mut fw.machine, 0x43, 0xF000, 0x0000); // font
 
-    // 6. Mark POST complete.
+    // 6. Narrate the result. A BIOS that says nothing on the screen is
+    //    very hard to debug, and this is what a user looks at first.
+    banner(fw, "WorkAgent");
+    banner(fw, "v86 permissive firmware");
+    banner(fw, "");
+
+    // 7. Report what POST found. These are the numbers a user can check
+    // against the emulated hardware, so print them rather than only
+    // tracing them.
+    let mem = bda::memory_kib(&mut fw.machine);
+    let equip = bda::equipment_word(&mut fw.machine);
+    let drives = drive_summary(fw);
+    banner(fw, &format!("Memory: {} KB", mem));
+    banner(fw, &format!("Drives: {}", drives));
+    fw.trace(
+        tag::POST,
+        &format!("POST done: {} KiB, equipment {:#06X}", mem, equip),
+    );
+
+    // 7. Mark POST complete.
     fw.pending_boot = true;
+    fw.trace(tag::POST, "POST complete");
+}
+
+/// Write one line to the screen through INT 10h AH=0Eh.
+///
+/// The firmware is its own video BIOS, so this is the same path a guest
+/// would take; doing it through the service rather than poking 0xB8000
+/// keeps the cursor and scroll bookkeeping correct.
+fn banner<M: Machine>(fw: &mut Firmware<M>, line: &str)
+{
+    for ch in line.chars().take(78) {
+        putc(fw, ch as u8);
+    }
+    putc(fw, b'\r');
+    putc(fw, b'\n');
+}
+
+/// INT 10h AH=0Eh — write one character at the cursor.
+fn putc<M: Machine>(fw: &mut Firmware<M>, ch: u8)
+{
+    // CRLF: the emulator's text page is not in raw mode.
+    let (row, col) = bda::cursor_pos(&mut fw.machine, fw.video.page);
+    if ch == b'\n'
+    {
+        let cols = fw.video.cols as u32;
+        let rows = fw.video.rows as u32;
+        let row = row as u32 + 1;
+
+        if row >= rows
+        {
+            crate::int10::scroll_up_full(fw);
+            bda::set_cursor_pos(&mut fw.machine, fw.video.page, (rows - 1) as u8, 0);
+        }
+        else
+        {
+            bda::set_cursor_pos(&mut fw.machine, fw.video.page, row as u8, 0);
+        }
+        let _ = (cols, col);
+        return;
+    }
+
+    let cols = fw.video.cols as u32;
+    let mut col = col as u32;
+    let mut row = row as u32;
+
+    if col >= cols
+    {
+        col = 0;
+        row += 1;
+    }
+    if row >= fw.video.rows as u32
+    {
+        crate::int10::scroll_up_full(fw);
+        row = fw.video.rows as u32 - 1;
+    }
+
+    let addr = crate::int10::VIDEO_COLOR_BASE + (row * cols + col) * 2;
+    fw.machine.write_u8(addr, ch);
+    fw.machine.write_u8(addr + 1, 0x07);
+    bda::set_cursor_pos(&mut fw.machine, fw.video.page, row as u8, (col + 1) as u8);
+}
+
+/// One-line summary of the registered drives, e.g. "1 floppy, 1 hard".
+fn drive_summary<M: Machine>(fw: &mut Firmware<M>) -> String {
+    let floppies = fw.drives.count(DriveKind::Floppy);
+    let hds = fw.drives.count(DriveKind::HardDisk);
+    let cds = fw.drives.count(DriveKind::CdRom);
+
+    let mut parts = Vec::new();
+
+    if floppies > 0 {
+        parts.push(format!("{} floppy", floppies));
+    }
+    if hds > 0 {
+        parts.push(format!("{} hard", hds));
+    }
+    if cds > 0 {
+        parts.push(format!("{} cd", cds));
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    }
+    else {
+        parts.join(", ")
+    }
 }
 
 /// Initialize the BIOS Data Area.
@@ -122,15 +302,6 @@ fn build_e820<M: Machine>(fw: &mut Firmware<M>) {
     }
 }
 
-/// Install firmware IVT markers for all BIOS service vectors.
-fn install_firmware_vectors<M: Machine>(fw: &mut Firmware<M>) {
-    for vector in [
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19, 0x1A,
-    ] {
-        ivt::install_firmware_vector(&mut fw.machine, vector);
-    }
-}
-
 /// Register a block backend as an INT 13h drive.
 pub fn register_drive<M: Machine>(
     fw: &mut Firmware<M>,
@@ -162,6 +333,7 @@ pub fn parse_eltorito<M: Machine>(
 /// Loads the boot sector from the first bootable device in the
 /// configured boot order and jumps to it.
 pub fn handle_int19<M: Machine>(fw: &mut Firmware<M>) -> bool {
+    fw.trace(tag::BOOT, "INT 19h: bootstrap");
     let boot_order: Vec<&'static str> = fw.config.boot_order.clone();
     for device in boot_order {
         match device {
@@ -183,7 +355,10 @@ pub fn handle_int19<M: Machine>(fw: &mut Firmware<M>) -> bool {
             _ => {}
         }
     }
-    // No bootable device found.
+    // No bootable device found. Say so on the screen: a machine that
+    // simply stops after POST is indistinguishable from a hang.
+    fw.trace(tag::BOOT, "no bootable device");
+    banner(fw, "No bootable device.");
     fw.set_error(status::DRIVE_NOT_READY);
     true
 }
@@ -199,8 +374,11 @@ fn boot_from_floppy<M: Machine>(fw: &mut Firmware<M>) -> bool {
         None => return false,
     };
     if !is_valid_boot_sector(&boot_sector) {
+        fw.trace(tag::BOOT, &format!("floppy 0x{:02X}: no 55AA signature", number));
         return false;
     }
+    fw.trace(tag::BOOT, &format!("booting floppy 0x{:02X}", number));
+    banner(fw, "Booting from floppy...");
     load_and_jump(fw, &boot_sector, number);
     true
 }
@@ -216,8 +394,11 @@ fn boot_from_hd<M: Machine>(fw: &mut Firmware<M>) -> bool {
         None => return false,
     };
     if !is_valid_boot_sector(&boot_sector) {
+        fw.trace(tag::BOOT, &format!("hard disk 0x{:02X}: no 55AA signature", number));
         return false;
     }
+    fw.trace(tag::BOOT, &format!("booting hard disk 0x{:02X}", number));
+    banner(fw, "Booting from hard disk...");
     load_and_jump(fw, &boot_sector, number);
     true
 }
@@ -275,8 +456,8 @@ fn boot_from_cd<M: Machine>(fw: &mut Firmware<M>) -> bool {
             fw.machine.write_reg(crate::machine::Reg::Edx, number as u32);
             fw.machine.write_reg(crate::machine::Reg::Esi, 0);
             fw.machine.write_reg(crate::machine::Reg::Edi, 0);
-            fw.machine.write_ip(0);
             fw.machine.write_seg(SegReg::Cs, load_seg);
+            fw.machine.write_ip(0);
             fw.set_cf(false);
             true
         }
@@ -385,7 +566,9 @@ fn load_and_jump<M: Machine>(fw: &mut Firmware<M>, sector: &[u8; 512], drive: u8
     fw.machine.write_reg(crate::machine::Reg::Edx, drive as u32);
     fw.machine.write_reg(crate::machine::Reg::Esi, 0);
     fw.machine.write_reg(crate::machine::Reg::Edi, 0);
-    fw.machine.write_ip(0);
+    // CS first: the instruction pointer is relative to the code segment,
+    // so writing IP before CS would compute the offset against the old one.
     fw.machine.write_seg(SegReg::Cs, 0x07C0);
+    fw.machine.write_ip(0);
     fw.set_cf(false);
 }

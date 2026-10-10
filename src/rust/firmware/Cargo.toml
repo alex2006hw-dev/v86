@@ -5,6 +5,13 @@ edition = "2021"
 description = "Permissively-licensed (MIT) PC/XT/AT BIOS firmware for the v86 emulator. PCjs-derived services plus modern features (INT 13h EDD/LBA, El Torito, VBE 2.0+) implemented from public specifications."
 license = "MIT"
 
+[features]
+# `standalone` builds the WASI host ABI (ffi.rs) used by the Node harness in
+# tests/firmware/. It is off by default because v86 itself supplies the
+# Machine implementation in Rust and has no business importing env::v86_*.
+default = []
+standalone = []
+
 [lib]
 path = "src/lib.rs"
 # "lib" so the firmware can be unit-tested and embedded in the main v86

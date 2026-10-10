@@ -1,14 +1,13 @@
 //! Tests for the v86-firmware crate.
 
 use v86_firmware::backend::{
-    BlockBackend, BlockInfo, DriveKind, Geometry, RamDisk, SECTOR_SIZE, CD_SECTOR_SIZE,
+    BlockInfo, DriveKind, Geometry, RamDisk, SECTOR_SIZE, CD_SECTOR_SIZE,
 };
 use v86_firmware::bda;
-use v86_firmware::dispatch::{bios_interrupt, Config, Firmware};
+use v86_firmware::dispatch::{dispatch_service, firmware_service, Config, Firmware};
 use v86_firmware::eltorito::{
-    self, BootInfo, ElToritoError, MEDIA_1440K_FLOPPY, MEDIA_NO_EMULATION, ISO_SECTOR,
+    self, ElToritoError, MEDIA_1440K_FLOPPY, MEDIA_NO_EMULATION,
 };
-use v86_firmware::int13::DriveTable;
 use v86_firmware::machine::{Flag, KeyEvent, Machine, Reg, RtcReading, SegReg};
 use v86_firmware::status;
 
@@ -23,8 +22,18 @@ struct TestMachine {
     sregs: [u16; 6],
     eflags: u32,
     ip: u32,
+    /// SS:SP, so the tests can drive `firmware_service` the way the CPU
+    /// does: the ROM stub pushes a service id and then traps.
+    stack: Vec<u16>,
+    /// Index in `stack` of the IP slot of the interrupt frame a guest's
+    /// `int n` pushed, if one is currently outstanding. `patch_saved_flags`
+    /// needs it: the FLAGS image is `SS:SP + 4`, three words above whatever
+    /// SS:SP happens to be once the service id has been popped.
+    frame_ip: Option<usize>,
     key_queue: Vec<KeyEvent>,
     rtc: RtcReading,
+    /// Far calls services asked for instead of performing them.
+    chains: Vec<(u16, u16)>,
 }
 
 impl TestMachine {
@@ -35,7 +44,10 @@ impl TestMachine {
             sregs: [0; 6],
             eflags: 0,
             ip: 0,
+            stack: Vec::new(),
+            frame_ip: None,
             key_queue: Vec::new(),
+            chains: Vec::new(),
             rtc: RtcReading {
                 year: 2026,
                 month: 10,
@@ -104,6 +116,59 @@ impl Machine for TestMachine {
     }
 
     fn request_reset(&mut self) {}
+
+    fn pop_stack_u16(&mut self) -> u16 {
+        self.stack.pop().unwrap_or(0)
+    }
+
+    fn peek_service_id(&self) -> u32 {
+        self.stack.last().copied().unwrap_or(0xFFFF) as u32
+    }
+
+    fn peek_stack_pointer(&self) -> u32 {
+        self.stack.len() as u32
+    }
+
+    fn patch_saved_flags(&mut self) {
+        // The CPU pushes IP, then CS, then FLAGS, so the FLAGS image is the
+        // third word above the frame's IP. Patching anywhere else silently
+        // corrupts the return address instead, which the regression test
+        // `saved_flags_are_patched_in_place_not_over_the_return_address`
+        // exists to catch.
+        let Some(ip_slot) = self.frame_ip else { return };
+        let slot = ip_slot + 2;
+        if let Some(word) = self.stack.get_mut(slot)
+        {
+            *word = (*word & !1) | (self.eflags & 1) as u16;
+        }
+    }
+
+    /// Far calls recorded instead of performed, so a test can assert that
+    /// an interrupt chained.
+    fn chain_to(&mut self, segment: u16, offset: u16) {
+        self.chains.push((segment, offset));
+    }
+}
+
+impl TestMachine {
+    /// Push a service id, as a ROM stub does before trapping.
+    fn push_service(&mut self, id: u16) {
+        self.stack.push(id);
+    }
+
+    /// Model a guest's `int n`: the CPU pushes FLAGS, CS and IP, and only
+    /// then does the ROM stub push its service id.
+    fn push_int_frame(&mut self, ip: u16, cs: u16, flags: u16) {
+        self.stack.push(ip);
+        self.stack.push(cs);
+        self.stack.push(flags);
+        self.frame_ip = Some(self.stack.len() - 3);
+    }
+
+    /// The FLAGS word of the outstanding frame, as `iret` would restore it.
+    fn frame_flags(&self) -> Option<u16> {
+        self.frame_ip.map(|i| self.stack[i + 2])
+    }
 }
 
 // ------------------------------------------------------------------
@@ -198,7 +263,7 @@ fn test_int13_reset() {
     fw.drives.add(0x00, Box::new(make_floppy()));
     fw.machine.write_reg8(Reg::Eax, true, 0x00); // AH=00h
     fw.machine.write_reg8(Reg::Edx, false, 0x00); // DL=0x00
-    bios_interrupt(&mut fw, 0x13);
+    dispatch_service(&mut fw, 0x13);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg8(Reg::Eax, true), status::SUCCESS);
 }
@@ -216,7 +281,7 @@ fn test_int13_read_sectors_chs() {
     fw.machine.write_reg8(Reg::Edx, false, 0x00); // DL=0x00
     fw.machine.write_seg(SegReg::Es, 0x0000);
     fw.machine.write_reg(Reg::Ebx, 0x7C00);
-    bios_interrupt(&mut fw, 0x13);
+    dispatch_service(&mut fw, 0x13);
     assert!(!fw.machine.read_flag(Flag::Cf));
     // Check that the boot signature was read.
     assert_eq!(fw.machine.read_u8(0x7C00 + 510), 0x55);
@@ -231,9 +296,36 @@ fn test_int13_edd_install_check() {
     fw.machine.write_reg8(Reg::Eax, true, 0x41);
     fw.machine.write_reg(Reg::Ebx, 0x55AA);
     fw.machine.write_reg8(Reg::Edx, false, 0x80);
-    bios_interrupt(&mut fw, 0x13);
+    dispatch_service(&mut fw, 0x13);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg(Reg::Ebx), 0xAA55);
+
+    // The rest of the answer is as specified, and each field was wrong
+    // before: AH carried the classic INT 13h success code instead of the
+    // Extensions major version, DH carried a nonsense 0x20, and DL still
+    // held the drive number the caller asked about instead of the number of
+    // drives. Found by running the same boot sector under
+    // `examples/firmware-oracle.js`.
+    assert_eq!(fw.machine.read_reg8(Reg::Eax, true), 0x03, "AH = EDD major version");
+    assert_eq!(fw.machine.read_reg8(Reg::Edx, true), 0x00, "DH = EDD minor version");
+    assert_eq!(fw.machine.read_reg8(Reg::Edx, false), 1, "DL = number of drives");
+    assert_eq!(fw.machine.read_reg(Reg::Ecx), 0x0007, "CX = extension bitmap");
+}
+
+#[test]
+fn test_int13_edd_install_check_reports_the_drive_count() {
+    // DL counts drives, so adding a second one has to change it.
+    let mut fw = make_firmware();
+    fw.drives.add(0x00, Box::new(make_floppy()));
+    fw.drives.add(0x80, Box::new(make_hd()));
+
+    fw.machine.write_reg8(Reg::Eax, true, 0x41);
+    fw.machine.write_reg(Reg::Ebx, 0x55AA);
+    fw.machine.write_reg8(Reg::Edx, false, 0x00);
+    dispatch_service(&mut fw, 0x13);
+
+    assert!(!fw.machine.read_flag(Flag::Cf));
+    assert_eq!(fw.machine.read_reg8(Reg::Edx, false), 2);
 }
 
 #[test]
@@ -254,7 +346,7 @@ fn test_int13_edd_read_sectors() {
     fw.machine.write_reg8(Reg::Edx, false, 0x80);
     fw.machine.write_seg(SegReg::Ds, 0x0000);
     fw.machine.write_reg(Reg::Esi, dap_addr as u32);
-    bios_interrupt(&mut fw, 0x13);
+    dispatch_service(&mut fw, 0x13);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_u8(0x7C00 + 510), 0x55);
     assert_eq!(fw.machine.read_u8(0x7C00 + 511), 0xAA);
@@ -269,7 +361,7 @@ fn test_int13_edd_get_drive_parameters() {
     fw.machine.write_reg8(Reg::Edx, false, 0x80);
     fw.machine.write_seg(SegReg::Es, 0x0000);
     fw.machine.write_reg(Reg::Edi, 0x0200);
-    bios_interrupt(&mut fw, 0x13);
+    dispatch_service(&mut fw, 0x13);
     assert!(!fw.machine.read_flag(Flag::Cf));
     // Check the params structure.
     let size = fw.machine.read_u16(0x0200);
@@ -285,7 +377,7 @@ fn test_int10_set_mode() {
     let mut fw = make_firmware();
     fw.machine.write_reg8(Reg::Eax, true, 0x00); // AH=00h
     fw.machine.write_reg8(Reg::Eax, false, 0x03); // AL=0x03
-    bios_interrupt(&mut fw, 0x10);
+    dispatch_service(&mut fw, 0x10);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.video.mode, 0x03);
 }
@@ -298,7 +390,7 @@ fn test_int10_tty_write() {
     fw.video.rows = 25;
     fw.machine.write_reg8(Reg::Eax, true, 0x0E); // AH=0Eh
     fw.machine.write_reg8(Reg::Eax, false, b'A'); // AL='A'
-    bios_interrupt(&mut fw, 0x10);
+    dispatch_service(&mut fw, 0x10);
     assert!(!fw.machine.read_flag(Flag::Cf));
     // Check that 'A' was written to video memory.
     assert_eq!(fw.machine.read_u8(0xB8000), b'A');
@@ -311,7 +403,7 @@ fn test_int10_get_mode() {
     fw.video.cols = 80;
     fw.video.page = 0;
     fw.machine.write_reg8(Reg::Eax, true, 0x0F); // AH=0Fh
-    bios_interrupt(&mut fw, 0x10);
+    dispatch_service(&mut fw, 0x10);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg8(Reg::Eax, false), 0x03); // AL=mode
     assert_eq!(fw.machine.read_reg8(Reg::Eax, true), 80); // AH=cols
@@ -325,7 +417,7 @@ fn test_int10_get_mode() {
 fn test_int16_peek_key_empty() {
     let mut fw = make_firmware();
     fw.machine.write_reg8(Reg::Eax, true, 0x01); // AH=01h
-    bios_interrupt(&mut fw, 0x16);
+    dispatch_service(&mut fw, 0x16);
     assert!(fw.machine.read_flag(Flag::Zf)); // ZF=1, no key
 }
 
@@ -337,7 +429,7 @@ fn test_int16_read_key() {
         pressed: true,
     });
     fw.machine.write_reg8(Reg::Eax, true, 0x00); // AH=00h
-    bios_interrupt(&mut fw, 0x16);
+    dispatch_service(&mut fw, 0x16);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg8(Reg::Eax, false), b'a'); // AL=ASCII
     assert_eq!(fw.machine.read_reg8(Reg::Eax, true), 0x1E); // AH=scancode
@@ -351,7 +443,7 @@ fn test_int16_read_key() {
 fn test_int15_a20_enable() {
     let mut fw = make_firmware();
     fw.machine.write_reg(Reg::Eax, 0x2401); // AX=2401h
-    bios_interrupt(&mut fw, 0x15);
+    dispatch_service(&mut fw, 0x15);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert!(fw.a20_enabled);
 }
@@ -360,7 +452,7 @@ fn test_int15_a20_enable() {
 fn test_int15_a20_disable() {
     let mut fw = make_firmware();
     fw.machine.write_reg(Reg::Eax, 0x2400); // AX=2400h
-    bios_interrupt(&mut fw, 0x15);
+    dispatch_service(&mut fw, 0x15);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert!(!fw.a20_enabled);
 }
@@ -370,7 +462,7 @@ fn test_int15_a20_query() {
     let mut fw = make_firmware();
     fw.a20_enabled = true;
     fw.machine.write_reg(Reg::Eax, 0x2402); // AX=2402h
-    bios_interrupt(&mut fw, 0x15);
+    dispatch_service(&mut fw, 0x15);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg8(Reg::Eax, false), 1); // AL=1 (enabled)
 }
@@ -393,7 +485,7 @@ fn test_int15_e820() {
     fw.machine.write_reg(Reg::Ebx, 0); // continuation
     fw.machine.write_seg(SegReg::Es, 0x0000);
     fw.machine.write_reg(Reg::Edi, 0x0300);
-    bios_interrupt(&mut fw, 0x15);
+    dispatch_service(&mut fw, 0x15);
     assert!(!fw.machine.read_flag(Flag::Cf));
     // Check first entry.
     let base = fw.machine.read_u64(0x0300);
@@ -412,7 +504,7 @@ fn test_int15_e820() {
 fn test_int1a_read_rtc_time() {
     let mut fw = make_firmware();
     fw.machine.write_reg8(Reg::Eax, true, 0x00); // AH=00h
-    bios_interrupt(&mut fw, 0x1A);
+    dispatch_service(&mut fw, 0x1A);
     assert!(!fw.machine.read_flag(Flag::Cf));
     // CH=seconds (BCD), CL=minutes (BCD), DH=hours (BCD)
     let seconds = fw.machine.read_reg8(Reg::Ecx, true);
@@ -428,7 +520,7 @@ fn test_int1a_read_rtc_time() {
 fn test_int1a_read_rtc_date() {
     let mut fw = make_firmware();
     fw.machine.write_reg8(Reg::Eax, true, 0x02); // AH=02h
-    bios_interrupt(&mut fw, 0x1A);
+    dispatch_service(&mut fw, 0x1A);
     assert!(!fw.machine.read_flag(Flag::Cf));
     // CH=century, CL=year, DH=month, DL=day
     let century = fw.machine.read_reg8(Reg::Ecx, true);
@@ -472,17 +564,71 @@ fn test_eltorito_emulated_media_sectors() {
 // ------------------------------------------------------------------
 
 #[test]
-fn test_post_init() {
+fn test_post_installs_real_rom_stubs() {
     let mut fw = make_firmware();
+    // install_roms is what the host does before the CPU leaves reset;
+    // run_post is what the ROM itself does once it is running.
+    v86_firmware::post::install_roms(&mut fw);
     v86_firmware::post::run_post(&mut fw);
-    // Check that firmware vectors were installed (marker seg:off at F000:0000).
-    assert_eq!(fw.machine.read_u16(0x10 * 4), 0x0000); // INT 10h offset
-    assert_eq!(fw.machine.read_u16(0x10 * 4 + 2), 0xF000); // INT 10h segment
-    // Check that the BDA was initialized.
+
+    // The IVT holds far pointers; the ROM window check wants a physical
+    // address, so convert rather than comparing packed values.
+    let mut far = |v: u32| {
+        fw.machine.read_u16(v * 4) as u32 | ((fw.machine.read_u16(v * 4 + 2) as u32) << 16)
+    };
+    let physical = |p: u32| ((p >> 16) << 4) + (p & 0xFFFF);
+
+    // INT 10h belongs to the video option ROM, not the system BIOS.
+    let ptr = far(0x10);
+    assert_eq!(ptr >> 16, 0xC000, "INT 10h should point into the VGA option ROM");
+    assert!(v86_firmware::rom::is_firmware_rom(physical(ptr)));
+
+    // The BIOS services belong to the system ROM.
+    for v in [0x11u32, 0x12, 0x13, 0x15, 0x16, 0x19] {
+        let ptr = far(v);
+        assert_eq!(
+            ptr >> 16, 0xF000,
+            "INT {:02X}h should point into the system ROM, got {:04X}:{:04X}",
+            v, ptr >> 16, ptr & 0xFFFF
+        );
+        assert!(
+            v86_firmware::rom::is_firmware_rom(physical(ptr)),
+            "INT {:02X}h lands outside every firmware ROM",
+            v
+        );
+    }
+
+    // INT 1Ah is shared: the system BIOS stubs it and the video ROM
+    // overrides it, because the VBE information block is found through
+    // INT 1Ah AH=4Fh. The video ROM must win.
+    let ptr = far(0x1A);
+    assert_eq!(ptr >> 16, 0xC000, "INT 1Ah belongs to the video ROM");
+
+    // And the code at each vector really is a trap stub.
+    let at10 = far(0x10) & 0xFFFF;
+    let seg10 = (far(0x10) >> 16) as u16;
+    let base = u32::from(seg10) << 4;
+    assert_eq!(fw.machine.read_u8(base + at10), 0x68, "push service id");
+    assert_eq!(
+        fw.machine.read_u8(base + at10 + 3),
+        0xCD,
+        "int"
+    );
+    assert_eq!(
+        fw.machine.read_u8(base + at10 + 4),
+        v86_firmware::rom::TRAP_VECTOR
+    );
+
+    // The BDA is initialised.
     assert_eq!(bda::memory_kib(&mut fw.machine), 640);
-    // Check that firmware vectors were installed.
-    assert_eq!(fw.machine.read_u16(0x13 * 4), 0x0000); // INT 13h offset
-    assert_eq!(fw.machine.read_u16(0x13 * 4 + 2), 0xF000); // INT 13h segment
+}
+
+#[test]
+fn test_reset_vector_is_reachable_in_the_system_rom() {
+    let mut fw = make_firmware();
+    v86_firmware::post::install_roms(&mut fw);
+    let reset = v86_firmware::rom::SYSTEM_ROM_BASE + 0xFFF0;
+    assert_eq!(fw.machine.read_u8(reset), 0xE9, "reset vector jumps to POST");
 }
 
 // ------------------------------------------------------------------
@@ -493,11 +639,13 @@ fn test_post_init() {
 fn test_vbe_get_controller_info() {
     let mut fw = make_firmware();
     // Install the VBE ROM data first (normally done during POST).
-    v86_firmware::vbe::install_vbe_rom(&mut fw);
+    // The VBE data now lives in the video option ROM; install_roms
+    // writes both images and the IVT that points at them.
+    v86_firmware::post::install_roms(&mut fw);
     fw.machine.write_reg(Reg::Eax, 0x4F00); // AX=4F00h
     fw.machine.write_seg(SegReg::Es, 0x0000);
     fw.machine.write_reg(Reg::Edi, 0x0400);
-    bios_interrupt(&mut fw, 0x10);
+    dispatch_service(&mut fw, 0x10);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg(Reg::Eax), 0x004F);
     // Check signature.
@@ -514,7 +662,7 @@ fn test_vbe_get_mode_info() {
     fw.machine.write_reg(Reg::Ecx, 0x101); // mode 0x101
     fw.machine.write_seg(SegReg::Es, 0x0000);
     fw.machine.write_reg(Reg::Edi, 0x0500);
-    bios_interrupt(&mut fw, 0x10);
+    dispatch_service(&mut fw, 0x10);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg(Reg::Eax), 0x004F);
     // Check width/height.
@@ -524,15 +672,140 @@ fn test_vbe_get_mode_info() {
     assert_eq!(height, 480);
 }
 
+/// A video chip that can produce every advertised mode.
+struct FakeVideo {
+    mode: u16,
+    linear: bool,
+    stride: u16,
+    dac: Vec<u8>,
+}
+
+impl v86_firmware::vbe::VideoHost for FakeVideo {
+    fn set_mode(&mut self, mode: u16, linear: bool) -> bool {
+        self.mode = mode;
+        self.linear = linear;
+        self.stride = v86_firmware::vbe::bytes_per_scanline(
+            &v86_firmware::vbe::VBE_MODES
+                .iter()
+                .find(|m| m.mode == mode)
+                .copied()
+                .unwrap_or(v86_firmware::vbe::VBE_MODES[0]),
+        );
+        true
+    }
+    fn current_mode(&self) -> u16 { self.mode }
+    fn linear_framebuffer(&self) -> u32 { 0xE000_0000 }
+    fn stride(&self) -> u16 { self.stride }
+    fn display_start(&self) -> (u16, u16) { (0, 0) }
+    fn set_display_start(&mut self, _x: u16, _y: u16) -> bool {
+        // This fake does not model a display start address; recording one
+        // would let a test assert on state the rest of the firmware never
+        // reads back.
+        true
+    }
+    fn dac(&self, first: u32, count: u32) -> Vec<u8> {
+        let a = (first * 3) as usize;
+        let b = a + (count * 3) as usize;
+        self.dac[a..b].to_vec()
+    }
+    fn set_dac(&mut self, first: u32, count: u32, data: &[u8]) {
+        let a = (first * 3) as usize;
+        let b = a + (count * 3) as usize;
+        self.dac[a..b].copy_from_slice(&data[..(count * 3) as usize]);
+    }
+    fn dac_entries(&self) -> u32 { 256 }
+    fn set_dac_width(&mut self, _bits: u8) {}
+    fn dac_width(&self) -> u8 { 6 }
+    fn window(&self) -> (u16, u16, u16) { (0xA000, 64, 64) }
+    fn save_state(&self) -> Vec<u8> { vec![0u8; 256] }
+    fn restore_state(&mut self, _state: &[u8]) -> bool { true }
+}
+
 #[test]
-fn test_vbe_set_mode() {
+fn test_vbe_set_mode_programs_the_chip() {
     let mut fw = make_firmware();
+    fw.set_video_chip(Box::new(FakeVideo { mode: 0xFFFF, linear: false, stride: 0, dac: vec![0u8; 768] }));
     fw.machine.write_reg(Reg::Eax, 0x4F02); // AX=4F02h
-    fw.machine.write_reg(Reg::Ebx, 0x101); // mode 0x101
-    bios_interrupt(&mut fw, 0x10);
+    fw.machine.write_reg(Reg::Ebx, 0x4117); // mode 0x117 + linear framebuffer
+    dispatch_service(&mut fw, 0x10);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg(Reg::Eax), 0x004F);
-    assert_eq!(fw.vbe.current_mode, 0x101);
+    assert_eq!(fw.vbe.current_mode, 0x117);
+    assert!(fw.vbe.linear, "bit 14 must be recorded for 4F03h");
+
+    // 4F03h echoes the mode back with the LFB bit still set.
+    fw.machine.write_reg(Reg::Eax, 0x4F03);
+    dispatch_service(&mut fw, 0x10);
+    assert_eq!(fw.machine.read_reg(Reg::Ebx), 0x4117);
+}
+
+#[test]
+fn test_vbe_set_mode_fails_on_an_unknown_mode() {
+    let mut fw = make_firmware();
+    fw.set_video_chip(Box::new(FakeVideo { mode: 0xFFFF, linear: false, stride: 0, dac: vec![0u8; 768] }));
+    fw.machine.write_reg(Reg::Eax, 0x4F02);
+    fw.machine.write_reg(Reg::Ebx, 0x199); // not in the mode table
+    dispatch_service(&mut fw, 0x10);
+    assert!(fw.machine.read_flag(Flag::Cf), "unknown mode must set carry");
+}
+
+#[test]
+fn test_vbe_set_mode_fails_when_the_chip_cannot_produce_it() {
+    // NullVideoHost cannot program anything: reporting success here would
+    // hand the guest a black screen.
+    let mut fw = make_firmware();
+    fw.machine.write_reg(Reg::Eax, 0x4F02);
+    fw.machine.write_reg(Reg::Ebx, 0x101);
+    dispatch_service(&mut fw, 0x10);
+    assert!(fw.machine.read_flag(Flag::Cf));
+    assert_ne!(fw.machine.read_reg(Reg::Eax) & 0xFF00, 0x4F00);
+}
+
+#[test]
+fn test_vbe_scanline_length_reports_the_real_stride() {
+    // 4F06h used to echo its input back, which is how panning silently
+    // broke. It must report what the chip is actually scanning out.
+    let mut fw = make_firmware();
+    fw.set_video_chip(Box::new(FakeVideo { mode: 0xFFFF, linear: false, stride: 0, dac: vec![0u8; 768] }));
+    fw.machine.write_reg(Reg::Eax, 0x4F02);
+    fw.machine.write_reg(Reg::Ebx, 0x111); // 640x480x16
+    dispatch_service(&mut fw, 0x10);
+    fw.machine.write_reg(Reg::Ecx, 0x9999); // a request the chip ignores
+    fw.machine.write_reg(Reg::Edx, 0x9999);
+    fw.set_bl(1);
+    fw.machine.write_reg(Reg::Eax, 0x4F06);
+    dispatch_service(&mut fw, 0x10);
+    assert!(!fw.machine.read_flag(Flag::Cf));
+    assert_eq!(fw.cx(), 640 * 2, "stride must be width * bytes-per-pixel");
+}
+
+#[test]
+fn test_vbe_palette_data_moves_bytes() {
+    let mut fw = make_firmware();
+    fw.set_video_chip(Box::new(FakeVideo { mode: 0xFFFF, linear: false, stride: 0, dac: vec![0u8; 768] }));
+    // Write three entries at index 0.
+    fw.machine.write_u8(0x0600, 0x11);
+    fw.machine.write_u8(0x0601, 0x22);
+    fw.machine.write_u8(0x0602, 0x33);
+    fw.set_bl(0);
+    fw.set_bh(0);
+    fw.set_cx(1);
+    fw.set_dx(0);
+    fw.set_es(0);
+    fw.set_di(0x0600);
+    fw.machine.write_reg(Reg::Eax, 0x4F09);
+    dispatch_service(&mut fw, 0x10);
+    assert!(!fw.machine.read_flag(Flag::Cf), "palette write must succeed");
+
+    // And read one back.
+    fw.set_bl(1);
+    fw.set_di(0x0700);
+    fw.machine.write_reg(Reg::Eax, 0x4F09);
+    dispatch_service(&mut fw, 0x10);
+    assert!(!fw.machine.read_flag(Flag::Cf));
+    assert_eq!(fw.machine.read_u8(0x0700), 0x11);
+    assert_eq!(fw.machine.read_u8(0x0701), 0x22);
+    assert_eq!(fw.machine.read_u8(0x0702), 0x33);
 }
 
 #[test]
@@ -540,7 +813,7 @@ fn test_vbe_get_mode() {
     let mut fw = make_firmware();
     fw.vbe.current_mode = 0x101;
     fw.machine.write_reg(Reg::Eax, 0x4F03); // AX=4F03h
-    bios_interrupt(&mut fw, 0x10);
+    dispatch_service(&mut fw, 0x10);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg(Reg::Ebx), 0x101);
 }
@@ -590,7 +863,7 @@ fn test_lba_to_chs() {
 #[test]
 fn test_int11_equipment() {
     let mut fw = make_firmware();
-    bios_interrupt(&mut fw, 0x11);
+    dispatch_service(&mut fw, 0x11);
     assert!(!fw.machine.read_flag(Flag::Cf));
     let equip = fw.machine.read_reg(Reg::Eax) as u16;
     assert!(equip & bda::equip::FLOPPY_INSTALLED != 0);
@@ -600,7 +873,90 @@ fn test_int11_equipment() {
 #[test]
 fn test_int12_memory() {
     let mut fw = make_firmware();
-    bios_interrupt(&mut fw, 0x12);
+    dispatch_service(&mut fw, 0x12);
     assert!(!fw.machine.read_flag(Flag::Cf));
     assert_eq!(fw.machine.read_reg(Reg::Eax), 640);
+}
+
+// ------------------------------------------------------------------
+// Interrupt frame tests
+//
+// The ROM stubs trap by executing `int 0x66`, which fires *before* the
+// CPU pushes anything, so the only thing on the stack when the service
+// runs is the service id. Popping it leaves the frame the *guest's*
+// original `int n` pushed: IP at SS:SP, CS at SS:SP+2, FLAGS at
+// SS:SP+4. The stub's `iret` restores that frame, which makes the
+// saved FLAGS word the only channel through which a service can return
+// carry to its caller.
+// ------------------------------------------------------------------
+
+#[test]
+fn saved_flags_carry_reaches_the_caller() {
+    let mut fw = make_firmware();
+
+    // A guest `int 13h` with carry *clear* on entry.
+    fw.machine.push_int_frame(0x1234, 0x07C0, 0x0202);
+    fw.machine.push_service(0x13);
+
+    // Read a drive that does not exist: the service reports failure.
+    fw.machine.write_reg(Reg::Edx, 0x7F);
+    firmware_service(&mut fw);
+
+    // The stub's `iret` will restore this word, so this is the carry the
+    // caller observes.
+    assert_eq!(
+        fw.machine.frame_flags(),
+        Some(0x0203),
+        "carry set by the service must reach the caller through the saved FLAGS"
+    );
+}
+
+#[test]
+fn saved_flags_are_patched_in_place_not_over_the_return_address() {
+    // Regression test. Patching at SS:SP instead of SS:SP+4 writes the
+    // carry bit into the *low byte of the saved return address*, which
+    // redirects the caller into the middle of the instruction it was
+    // about to run. It is invisible in any test that only looks at the
+    // flag, and in the emulator it hangs the guest inside its own boot
+    // sector.
+    let mut fw = make_firmware();
+
+    let return_ip = 0x012Bu16;
+    fw.machine.push_int_frame(return_ip, 0x07C0, 0x0202);
+    fw.machine.push_service(0x13);
+
+    fw.machine.write_reg(Reg::Edx, 0x7F);
+    firmware_service(&mut fw);
+
+    let frame_ip = fw.machine.frame_ip.expect("frame outstanding");
+    let stack = &fw.machine.stack;
+
+    assert_eq!(
+        stack[frame_ip],
+        return_ip,
+        "the saved return address must be byte-for-byte unchanged"
+    );
+    assert_eq!(stack[frame_ip + 1], 0x07C0, "the saved CS must be unchanged");
+}
+
+#[test]
+fn saved_flags_are_untouched_when_no_frame_is_outstanding() {
+    // POST traps from ROM with nothing pushed but its own service id, so
+    // there is no guest frame to patch. That must be a no-op rather than
+    // a wild write.
+    let mut fw = make_firmware();
+
+    // A sentinel below the service id, standing in for whatever the ROM had
+    // on its stack when it trapped.
+    const SENTINEL: u16 = 0xBEEF;
+    fw.machine.stack.push(SENTINEL);
+    fw.machine.push_service(v86_firmware::rom::SERVICE_POST);
+
+    firmware_service(&mut fw);
+
+    assert_eq!(
+        fw.machine.stack,
+        vec![SENTINEL],
+        "with no frame outstanding, the service id is popped and nothing else is written"
+    );
 }

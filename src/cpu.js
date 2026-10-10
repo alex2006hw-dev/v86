@@ -360,6 +360,25 @@ CPU.prototype.wasm_patch = function()
 
     this.reset_cpu = get_import("reset_cpu");
 
+    // Permissively-licensed firmware. Optional: when `settings.firmware`
+    // is not "pcjs" these stay unused and SeaBIOS is loaded instead.
+    this.firmware_init = this.wm.exports["v86_firmware_init"];
+    this.firmware_add_floppy = this.wm.exports["v86_firmware_add_floppy"];
+    this.firmware_drive_ptr = this.wm.exports["v86_firmware_drive_ptr"];
+    this.firmware_drive_len = this.wm.exports["v86_firmware_drive_len"];
+    this.firmware_set_rtc = this.wm.exports["v86_firmware_set_rtc"];
+    this.firmware_set_trace = this.wm.exports["v86_firmware_set_trace"];
+    this.firmware_trace_ptr = this.wm.exports["v86_firmware_trace_ptr"];
+    this.firmware_trace_len = this.wm.exports["v86_firmware_trace_len"];
+    this.firmware_trace_dropped = this.wm.exports["v86_firmware_trace_dropped"];
+    this.firmware_trap_count = this.wm.exports["v86_firmware_trap_count"];
+    this.firmware_last_service = this.wm.exports["v86_firmware_last_service"];
+    this.firmware_present = this.wm.exports["v86_firmware_present"];
+    this.firmware_trap_ring_len = this.wm.exports["v86_firmware_trap_ring_len"];
+    this.firmware_trap_ring = this.wm.exports["v86_firmware_trap_ring"];
+    this.firmware_trap_ring_service = this.wm.exports["v86_firmware_trap_ring_service"];
+    this.firmware_trap_ring_stack = this.wm.exports["v86_firmware_trap_ring_stack"];
+
     this.getiopl = get_import("getiopl");
     this.get_eflags = get_import("get_eflags");
 
@@ -1013,6 +1032,20 @@ CPU.prototype.init = function(settings, device_bus)
 
     this.acpi_enabled[0] = +settings.acpi;
 
+    // The firmware keeps its own copy of the boot media in wasm memory, but
+    // constructing IO below transfers the disk buffers to the disk devices
+    // and detaches them. Snapshot whatever the firmware will need while the
+    // buffers are still live.
+    this.firmware_boot_drives = null;
+
+    if(settings.firmware === "pcjs")
+    {
+        this.firmware_boot_drives = ["fda", "fdb"]
+            .map(name => settings[name] && settings[name].buffer &&
+                { type: name, buffer: settings[name].buffer.slice(0) })
+            .filter(Boolean);
+    }
+
     this.reset_cpu();
 
     var io = new IO(this);
@@ -1021,7 +1054,27 @@ CPU.prototype.init = function(settings, device_bus)
     this.bios.main = settings.bios;
     this.bios.vga = settings.vga_bios;
 
-    this.load_bios();
+    let firmware_loaded = false;
+
+    if(settings.firmware === "pcjs")
+    {
+        if(this.load_firmware(settings, this.firmware_boot_drives))
+        {
+            dbg_log("Using the built-in firmware");
+            firmware_loaded = true;
+        }
+        else
+        {
+            dbg_log("Firmware unavailable; falling back to the BIOS image");
+        }
+    }
+
+    // The firmware brings its own ROMs, so only load a BIOS image when one
+    // was actually supplied.
+    if(!firmware_loaded)
+    {
+        this.load_bios();
+    }
 
     if(settings.bzimage)
     {
@@ -1694,6 +1747,79 @@ CPU.prototype.fill_cmos = function(rtc, settings)
 
     // Used by bochs BIOS to skip the boot menu delay.
     if(settings.fastboot) rtc.cmos_write(0x3f, 0x01);
+};
+
+/**
+ * Bring up the built-in PCjs-derived firmware instead of loading a ROM
+ * image. Must be called with the CPU in reset: `reset_cpu` leaves
+ * CS:IP at F000:FFF0, which is where the firmware's reset vector lives.
+ *
+ * @param {object} settings
+ * @param {Array}  boot_drives  descriptors to register with INT 13h
+ * @return {boolean} true if the firmware is running
+ */
+CPU.prototype.load_firmware = function(settings, boot_drives)
+{
+    if(!this.firmware_init)
+    {
+        dbg_log("Firmware support is missing from this build of v86");
+        return false;
+    }
+
+    var memory_kib = settings.memory_size ? Math.min(settings.memory_size >> 10, 65535) : 640;
+    var floppy_count = (boot_drives || []).filter(function(d) { return d.type === "fda"; }).length;
+
+    this.firmware_set_trace && this.firmware_set_trace(settings.firmware_trace ? 1 : 0);
+
+    var ok = this.firmware_init(
+        memory_kib,
+        Math.min(floppy_count, 2),
+        1,   // serial ports
+        1,   // parallel ports
+        0,   // math coprocessor
+        0x7, // boot order: floppy, hard disk, CD
+    );
+
+    if(!ok)
+    {
+        return false;
+    }
+
+    for(var i = 0; i < (boot_drives || []).length; i++)
+    {
+        var drive = boot_drives[i];
+
+        if(drive.type !== "fda" || !drive.buffer)
+        {
+            continue;
+        }
+
+        var sectors = drive.buffer.byteLength >> 9;
+        var number = this.firmware_add_floppy(sectors);
+
+        if(number < 0)
+        {
+            dbg_log("Firmware: could not register floppy " + drive.name);
+            continue;
+        }
+
+        // The image is copied straight into the drive's buffer; the
+        // firmware's INT 13h then reads it like any other block device.
+        var ptr = this.firmware_drive_ptr(number);
+        var len = this.firmware_drive_len(number);
+
+        if(ptr && len)
+        {
+            // Read .buffer here, not once up front: the wasm memory grows
+            // during device setup, which detaches the previous buffer.
+            var copy = Math.min(len, drive.buffer.byteLength);
+            var memory = this.wasm_memory.buffer;
+            new Uint8Array(memory, ptr, copy).set(new Uint8Array(drive.buffer, 0, copy));
+            dbg_log("Firmware: floppy drive 0x" + number.toString(16) + " = " + copy + " bytes");
+        }
+    }
+
+    return true;
 };
 
 CPU.prototype.load_bios = function()

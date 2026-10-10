@@ -48,6 +48,10 @@ impl Flag {
 }
 
 /// Real-time clock reading, as provided by the host.
+///
+/// The default is a fixed, valid date rather than the epoch so that a
+/// host which has not wired up a clock still yields a BIOS that passes
+/// `INT 1Ah` sanity checks instead of reporting year 1970.
 #[derive(Copy, Clone, Debug)]
 pub struct RtcReading {
     pub year: u32,    // full year, e.g. 2026
@@ -57,6 +61,20 @@ pub struct RtcReading {
     pub minute: u32,  // 0..=59
     pub second: u32,  // 0..=59
     pub day_of_week: u32, // 0=Sunday .. 6=Saturday
+}
+
+impl Default for RtcReading {
+    fn default() -> RtcReading {
+        RtcReading {
+            year: 1980,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            day_of_week: 2, // 1980-01-01 was a Tuesday
+        }
+    }
 }
 
 /// Keyboard scancode event from the host input backend.
@@ -155,6 +173,54 @@ pub trait Machine {
     /// Request a machine reset (used by port 0x92 fast-reset and
     /// triple-fault style resets).
     fn request_reset(&mut self);
+
+    // ------------------------------------------------------------------
+    // Hardware acknowledgement
+    // ------------------------------------------------------------------
+    //
+    // A real BIOS services an IRQ by talking to the controller that
+    // raised it. Leaving these to the host keeps the firmware from
+    // having to know the emulated chipset's register layout.
+
+    /// Acknowledge the floppy controller's interrupt.
+    fn acknowledge_floppy(&mut self) {}
+
+    /// Acknowledge the real-time clock by clearing the interrupt-request
+    /// flag in CMOS status register C.
+    fn acknowledge_rtc(&mut self) {}
+
+    /// Perform a far call to `segment:offset`, as an interrupt service
+    /// chaining to the next handler in a chain does. The default
+    /// implementation is a no-op so hosts that do not chain need do
+    /// nothing.
+    fn chain_to(&mut self, _segment: u16, _offset: u16) {}
+
+    /// Pop a 16-bit word from the current real-mode stack (SS:SP) and
+    /// advance SP.
+    ///
+    /// A ROM stub pushes its service id and then traps, so this is how
+    /// the firmware learns which service was requested.
+    fn pop_stack_u16(&mut self) -> u16;
+
+    /// Read the top of the stack without consuming it. For diagnostics:
+    /// a host can show which service a stub asked for without having to
+    /// disturb the dispatch.
+    fn peek_service_id(&self) -> u32;
+
+    /// The current real-mode stack pointer value, for diagnostics.
+    fn peek_stack_pointer(&self) -> u32;
+
+    /// Copy the carry flag into the FLAGS image the trap interrupt pushed.
+    ///
+    /// This is not optional. `INT n` pushes FLAGS *before* the handler
+    /// runs, and the handler's `IRET` pops that image back — so a service
+    /// that sets carry in its own FLAGS would have the change thrown away,
+    /// and the caller would see the flags it had on entry. Every BIOS
+    /// service that reports status through carry needs this, which is why
+    /// real firmware does the same thing with `pushf`/`pop ax`/`push`.
+    ///
+    /// The default is a no-op for hosts that do not push a frame.
+    fn patch_saved_flags(&mut self) {}
 }
 
 /// Real-mode physical address of a segmented pointer.

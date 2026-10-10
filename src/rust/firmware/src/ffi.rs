@@ -8,10 +8,10 @@
 //! Only compiled for wasm targets, so the crate's host-side unit tests
 //! (which use their own `Machine`) are unaffected.
 
-#![cfg(target_arch = "wasm32")]
+#![cfg(all(feature = "standalone", target_arch = "wasm32"))]
 
 use crate::backend::{BlockInfo, DriveKind, RamDisk, SECTOR_SIZE, FLOPPY_1440K};
-use crate::dispatch::{self, Config, E820Entry};
+use crate::dispatch::{Config, E820Entry};
 use crate::machine::{Flag, KeyEvent, Machine, Reg, RtcReading, SegReg};
 use crate::Firmware;
 
@@ -34,6 +34,10 @@ extern "C" {
     fn v86_rtc(i: u32) -> u32;
     fn v86_poll_key() -> u32; // (pressed << 8) | scancode; 0xFFFF = none
     fn v86_reset();
+    /// Pop a word from the guest stack, exactly as the v86 adapter does.
+    fn v86_pop_stack_u16() -> u32;
+    fn v86_peek_service_id() -> u32;
+    fn v86_patch_saved_flags();
 }
 
 struct HostMachine;
@@ -107,6 +111,22 @@ impl Machine for HostMachine {
     fn request_reset(&mut self) {
         unsafe { v86_reset() }
     }
+
+    fn pop_stack_u16(&mut self) -> u16 {
+        unsafe { v86_pop_stack_u16() as u16 }
+    }
+
+    fn peek_service_id(&self) -> u32 {
+        unsafe { v86_peek_service_id() }
+    }
+
+    fn peek_stack_pointer(&self) -> u32 {
+        unsafe { v86_pop_stack_u16() }
+    }
+
+    fn patch_saved_flags(&mut self) {
+        unsafe { v86_patch_saved_flags() }
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -156,13 +176,21 @@ pub extern "C" fn fw_set_memory_kib(f: *mut FirmwareBox, kib: u32) {
     unsafe { &mut *f }.inner_mut().config.memory_kib = kib as u16;
 }
 
-/// Enable or disable VBE (installs the mode table at 0xC8000).
+/// Write the system BIOS and video option ROM into guest memory and
+/// point the IVT at their stubs.
 #[no_mangle]
-pub extern "C" fn fw_install_vbe(f: *mut FirmwareBox) {
+pub extern "C" fn fw_install_roms(f: *mut FirmwareBox) {
     if f.is_null() {
         return;
     }
-    crate::vbe::install_vbe_rom(unsafe { &mut *f }.inner_mut());
+    crate::post::install_roms(unsafe { &mut *f }.inner_mut());
+}
+
+/// Physical address of the ROM reset vector, so the harness can enter the
+/// firmware the way the CPU does after reset.
+#[no_mangle]
+pub extern "C" fn fw_reset_vector() -> u32 {
+    crate::rom::SYSTEM_ROM_BASE + 0xFFF0
 }
 
 /// Run POST.
@@ -181,7 +209,7 @@ pub extern "C" fn fw_interrupt(f: *mut FirmwareBox, vector: u32) -> u32 {
         return 0;
     }
     let fw = unsafe { &mut *f };
-    dispatch::bios_interrupt(fw.inner_mut(), vector as u8) as u32
+    crate::dispatch::dispatch_service(fw.inner_mut(), vector as u16) as u32
 }
 
 /// Add a RAM-backed floppy drive; returns its INT 13h number.

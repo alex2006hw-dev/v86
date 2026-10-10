@@ -4,6 +4,12 @@ version = "0.1.0"
 publish = false
 edition = "2021"
 
+[dependencies]
+# The permissively-licensed PC/XT/AT firmware. It is a separate crate so
+# that it can be unit-tested on its own and built to wasm32-wasip1 for the
+# standalone Node test harness; see src/rust/firmware/README.md.
+v86-firmware = { path = "src/rust/firmware", default-features = false }
+
 [features]
 default = []
 profiler = []

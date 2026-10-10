@@ -5,7 +5,8 @@ mod dbg;
 mod paging;
 
 pub mod cpu;
-pub mod fw_adapter;
+pub use v86_firmware as firmware;
+
 pub mod fw_adapter;
 
 pub mod js_api;

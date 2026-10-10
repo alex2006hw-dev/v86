@@ -79,11 +79,34 @@ pub struct VideoState {
 }
 
 /// Keyboard state tracked by the firmware.
-#[derive(Copy, Clone, Debug, Default)]
+///
+/// The keyboard buffer itself lives in the BIOS Data Area at 0x41E,
+/// because software is entitled to read and write it directly. This
+/// struct holds only the state that has no memory-mapped home: the
+/// typematic rate, and a small overflow counter for the rare case where
+/// the host queues a scancode before POST has cleared the buffer.
+#[derive(Clone, Debug, Default)]
 pub struct KeyboardState {
-    pub shift_flags: u8,
-    pub led_state: u8,
+    /// Typematic rate byte written by INT 16h AH=F3h.
     pub typematic_rate: u8,
+    /// Number of scancodes dropped because the buffer was full.
+    pub dropped: u32,
+}
+
+impl KeyboardState {
+    /// Append a scancode to the BDA keyboard buffer, storing ASCII 0
+    /// because the firmware has not done a translation yet.
+    ///
+    /// Returns false when the buffer is full, which is exactly what
+    /// real hardware does: the scancode is lost, not overwritten.
+    pub fn push_bda<M: Machine>(&mut self, machine: &mut M, scancode: u8) -> bool {
+        if bda::kbd_store(machine, 0, scancode) {
+            true
+        } else {
+            self.dropped += 1;
+            false
+        }
+    }
 }
 
 /// CMOS/RTC state.
@@ -107,18 +130,12 @@ impl Default for Cmos {
 /// VBE state tracked by the firmware.
 #[derive(Clone, Debug, Default)]
 pub struct VbeState {
-    /// Current VBE mode (0 = not in VBE mode).
+    /// Current VBE mode (`0xFFFF` = not in a VBE mode).
     pub current_mode: u16,
-    /// Window number (0 or 1) for 4F05h.
-    pub window: u8,
-    /// Window granularity in KiB.
-    pub granularity: u16,
-    /// Window size in KiB.
-    pub window_size: u16,
-    /// DAC palette width (6 or 8 bits).
-    pub dac_width: u8,
+    /// Whether the last mode set asked for the linear framebuffer.
+    pub linear: bool,
     /// Saved video state for 4F04h.
-    pub saved_state: Option<Box<[u8; 256]>>,
+    pub saved_state: Option<Vec<u8>>,
 }
 
 /// The firmware core. Generic over the machine abstraction.
@@ -137,6 +154,16 @@ pub struct Firmware<M: Machine> {
     pub cached_catalog: Option<[u8; 2048]>,
     /// Set when INT 19h should be invoked at the end of POST.
     pub pending_boot: bool,
+    /// The emulated video chip. Services program it instead of
+    /// touching registers themselves, so the firmware and the device
+    /// model cannot disagree about what mode the machine is in.
+    pub video_chip: Box<dyn crate::vbe::VideoHost>,
+    /// Where the system ROM stubs live, once installed.
+    pub roms: Option<crate::rom::SystemRomLayout>,
+    /// Where the video option ROM's entry points live, once installed.
+    pub vga_rom: Option<crate::rom::VgaRomLayout>,
+    /// Diagnostics: what the firmware did, for the host to read.
+    pub trace: crate::debug::Trace,
 }
 
 impl<M: Machine> Firmware<M> {
@@ -155,7 +182,40 @@ impl<M: Machine> Firmware<M> {
             boot_info: None,
             cached_catalog: None,
             pending_boot: false,
+            video_chip: Box::new(crate::vbe::NullVideoHost),
+            roms: None,
+            vga_rom: None,
+            trace: crate::debug::Trace::new(),
         }
+    }
+
+    /// Attach the host's video device to the firmware.
+    pub fn set_video_chip(&mut self, chip: Box<dyn crate::vbe::VideoHost>) {
+        self.video_chip = chip;
+    }
+
+    /// Record a diagnostic line. Cheap when tracing is off, which is the
+    /// default, so services can call it unconditionally.
+    pub fn trace(&mut self, tag: u8, line: impl AsRef<str>) {
+        self.trace.record(tag, line.as_ref());
+    }
+
+    /// Run `body` with the video chip borrowed alongside `self`.
+    ///
+    /// The chip is moved out and back because a service needs `self`
+    /// for the CPU state at the same time; `Box` is one pointer wide so
+    /// this is free in practice.
+    pub fn with_video<R>(
+        &mut self,
+        body: impl FnOnce(&mut Self, &mut dyn crate::vbe::VideoHost) -> R,
+    ) -> R {
+        let mut chip = std::mem::replace(
+            &mut self.video_chip,
+            Box::new(crate::vbe::NullVideoHost),
+        );
+        let r = body(self, &mut *chip);
+        self.video_chip = chip;
+        r
     }
 
     // ------------------------------------------------------------------
@@ -279,12 +339,39 @@ impl<M: Machine> Firmware<M> {
 // Top-level BIOS interrupt dispatcher
 // ----------------------------------------------------------------------
 
-/// Entry point for firmware-owned interrupts. The emulator calls
-/// this when a real-mode software interrupt's IVT entry points into
-/// the firmware marker area. Returns true if the firmware handled
-/// the interrupt.
-pub fn bios_interrupt<M: Machine>(fw: &mut Firmware<M>, vector: u8) -> bool {
-    match vector {
+/// Entry point for the ROM stubs. The emulator calls this when the CPU
+/// executes `INT rom::TRAP_VECTOR` with the return address inside one of
+/// the firmware's own ROM windows, and passes the service id that the
+/// stub pushed.
+///
+/// `service` is the 16-bit id read off the guest stack; the firmware
+/// consumes it, so the stub's `iret` resumes cleanly afterwards.
+///
+/// Returns true if the service was handled.
+pub fn firmware_service<M: Machine>(fw: &mut Firmware<M>) -> bool {
+    let service = fw.machine.pop_stack_u16();
+    let handled = dispatch_service(fw, service);
+
+    // The stub's `iret` will restore the FLAGS image the trap interrupt
+    // pushed, which predates whatever the service just did. Copy carry
+    // across, or every status-returning service reports success.
+    fw.machine.patch_saved_flags();
+    handled
+}
+
+/// Run one service by id. Split out from [`firmware_service`] so tests
+/// can drive a service without arranging a guest stack.
+pub fn dispatch_service<M: Machine>(fw: &mut Firmware<M>, service: u16) -> bool {
+    match service {
+        crate::rom::SERVICE_POST => {
+            crate::post::run_post(fw);
+            true
+        }
+        0x08 => crate::irq::handle_irq0(fw),
+        0x09 => crate::irq::handle_irq1(fw),
+        0x0E => crate::irq::handle_irq6(fw),
+        0x70 => crate::irq::handle_irq8(fw),
+        0x74 => crate::irq::handle_irq12(fw),
         0x10 => crate::int10::handle_int10(fw),
         0x11 => handle_int11(fw),
         0x12 => handle_int12(fw),

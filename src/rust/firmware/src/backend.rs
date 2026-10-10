@@ -141,6 +141,15 @@ pub trait BlockBackend {
     fn seek(&mut self, _lba: u64) -> Result<(), Int13Status> {
         Ok(())
     }
+
+    /// If this backend is a [`RamDisk`], return it.
+    ///
+    /// A host that already holds the image bytes can then write them
+    /// straight into the drive instead of pushing every sector through
+    /// `write_sectors`. Only `RamDisk` overrides this.
+    fn downcast_ram_disk(&mut self) -> Option<&mut RamDisk> {
+        None
+    }
 }
 
 /// In-memory block backend (used by tests and small images).
@@ -200,6 +209,10 @@ impl BlockBackend for RamDisk {
         let c = self.changed;
         self.changed = false;
         c
+    }
+
+    fn downcast_ram_disk(&mut self) -> Option<&mut RamDisk> {
+        Some(self)
     }
 }
 

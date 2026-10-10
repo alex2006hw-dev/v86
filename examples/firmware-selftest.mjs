@@ -1,0 +1,496 @@
+// Build a 1.44 MiB floppy whose boot sector is a BIOS self-test.
+//
+// The self-test is hand-assembled here so the example needs no assembler
+// toolchain and no disk image: `node examples/firmware.js` works in a
+// clean checkout.
+//
+// It checks the services a boot loader and a DOS kernel depend on, in the
+// order a cold boot would use them:
+//
+//   M  INT 12h   conventional memory is at least 512 KiB
+//   E  INT 11h   the equipment word reports a floppy
+//   T  INT 1Ah   AH=02h reports a non-zero century in CH and a non-zero day in DL
+//   R  INT 13h   AH=00h reset succeeds
+//   G  INT 13h   AH=04h returns a usable drive geometry
+//   D  INT 13h   AH=41h EDD install check sets BX=AA55h
+//   B  INT 13h   AH=42h reads LBA 0 through a disk address packet
+//   S  the sector read back is this boot sector (0xAA55)
+//   8  INT 15h   AX=E820h returns a system memory map
+//   0  INT 15h   the first SMAP entry describes memory at base 0
+//   A  INT 15h   AX=2402h A20 query succeeds
+//   C  INT 10h   AH=0Fh reports 80 columns
+//   Q  INT 10h   AH=0Eh writes a character to the screen
+//
+// A failure prints a single character naming the check, then `RESULT: FAIL`
+//; passing every check prints `RESULT: PASS`.
+//
+// Two constraints shape the layout, and both come from how a real boot
+// works: the BIOS loads exactly 512 bytes to 0000:7C00, and nothing else
+// from the floppy is available until the guest reads it. So the code and
+// its strings have to fit in one sector, and every failure path has to be
+// a branch to a shared routine rather than an inline copy -- thirteen
+// inlined copies would not fit.
+
+const SECTOR_SIZE = 512;
+const FLOPPY_SECTORS = 2880;          // 1.44 MiB
+
+// Working data lives in its own segment well clear of the boot sector, so
+// the disk read in check B can overwrite a whole sector without trampling
+// the code that is running.
+const DATA_SEG = 0x2000;              // physical 0x20000
+const DATA_BASE = DATA_SEG << 4;
+
+const DAP      = 0x0000;              // 16-byte disk address packet
+const BUFFER   = 0x0100;              // 512-byte landing zone for the read
+const SMAP     = 0x0300;              // 24-byte E820 entry
+
+export function build_self_test_floppy()
+{
+    const image = new Uint8Array(FLOPPY_SECTORS * SECTOR_SIZE);
+    const { code, pass_at, fail_at } = assemble_self_test();
+
+    if(code.length > SECTOR_SIZE)
+    {
+        throw new Error("boot sector is " + code.length +
+            " bytes; a BIOS only loads " + SECTOR_SIZE);
+    }
+
+    image.set(code, 0);
+    image[510] = 0x55;
+    image[511] = 0xAA;
+    image[pass_at] = 0;
+    image[fail_at] = 0;
+
+    return image.buffer;
+}
+
+/**
+ * A minimal 16-bit assembler: labels with forward-reference patching.
+ *
+ * Only the instructions the self-test needs, always with explicit
+ * operands, so a mistake shows up as a wrong byte pattern rather than a
+ * silent misparse.
+ */
+export class Asm
+{
+    constructor(size)
+    {
+        this.buf = new Uint8Array(size);
+        this.pos = 0;
+        this.labels = new Map();
+        this.fixups = [];
+    }
+
+    label(name)
+    {
+        if(this.labels.has(name))
+        {
+            throw new Error("duplicate label: " + name);
+        }
+        this.labels.set(name, this.pos);
+        return this;
+    }
+
+    at(offset)
+    {
+        this.pos = offset;
+        return this;
+    }
+
+    b(...bytes)
+    {
+        for(const x of bytes)
+        {
+            if(this.pos >= this.buf.length)
+            {
+                throw new Error("boot sector overflow");
+            }
+            this.buf[this.pos++] = x & 0xFF;
+        }
+        return this;
+    }
+
+    w(value)
+    {
+        return this.b(value & 0xFF, (value >> 8) & 0xFF);
+    }
+
+    ascii(text)
+    {
+        for(const ch of text)
+        {
+            this.b(ch.charCodeAt(0));
+        }
+        return this.b(0);
+    }
+
+    rel16(name)
+    {
+        this.fixups.push({ at: this.pos, name, kind: "rel16" });
+        return this.w(0);
+    }
+
+    rel8(name)
+    {
+        this.fixups.push({ at: this.pos, name, kind: "rel8" });
+        return this.b(0);
+    }
+
+    link()
+    {
+        for(const f of this.fixups)
+        {
+            const target = this.labels.get(f.name);
+
+            if(target === undefined)
+            {
+                throw new Error("undefined label: " + f.name);
+            }
+
+            if(f.kind === "rel16")
+            {
+                const rel = target - (f.at + 2);
+                this.buf[f.at] = rel & 0xFF;
+                this.buf[f.at + 1] = (rel >> 8) & 0xFF;
+            }
+            else if(f.kind === "absolute")
+            {
+                this.buf[f.at] = target & 0xFF;
+                this.buf[f.at + 1] = (target >> 8) & 0xFF;
+            }
+            else
+            {
+                const rel = target - (f.at + 1);
+
+                if(rel < -128 || rel > 127)
+                {
+                    throw new Error("short jump to " + f.name + " out of range: " + rel);
+                }
+
+                this.buf[f.at] = rel & 0xFF;
+            }
+        }
+
+        return this.buf;
+    }
+
+    // ---- instructions -------------------------------------------------
+
+    cli()   { return this.b(0xFA); }
+    sti()   { return this.b(0xFB); }
+    pushf() { return this.b(0x9C); }
+    popf()  { return this.b(0x9D); }
+    pop_ax() { return this.b(0x58); }
+    push_ax() { return this.b(0x50); }
+    lahf()  { return this.b(0x9F); }
+    hlt()   { return this.b(0xF4); }
+    lodsb() { return this.b(0xAC); }
+    ret()   { return this.b(0xC3); }
+
+    xor_ax_ax() { return this.b(0x31, 0xC0); }
+    or_al_al()  { return this.b(0x08, 0xC0); }
+
+    // B8+rd, iw -- rd is AX,CX,DX,BX,SP,BP,SI,DI
+    mov_r16(reg, imm) { return this.b(0xB8 + reg).w(imm); }
+
+    /** `mov si, <label>` — the label's offset is an immediate. */
+    mov_si_label(name) {
+        this.fixups.push({ at: this.pos + 1, name, kind: "absolute" });
+        return this.b(0xBE).w(0);
+    }
+    mov_ah(v) { return this.b(0xB4, v); }
+    mov_al(v) { return this.b(0xB0, v); }
+    mov_dl(v) { return this.b(0xB2, v); }
+
+    // 8E /r with the segment selector in the reg field; the index order
+    // here is ES, CS, SS, DS, FS, GS.
+    mov_seg_ax(seg) { return this.b(0x8E, 0xC0 | ((seg & 7) << 3)); }
+
+    mov_ds_cs() { return this.b(0x0E, 0x1F); }   // push cs; pop ds
+
+    mov_ax_moffs(disp)     { return this.b(0xA1).w(disp); }        // A1 moffs
+    mov_moffs_imm16(d, i)  { return this.b(0xC7, 0x06).w(d).w(i); }  // C7 /0
+
+    // 89 /r: [disp16] <- reg
+    mov_moffs_reg(d, reg) {
+        return this.b(0x89, [0x06, 0x0E, 0x16, 0x1E, 0x26, 0x2E, 0x36, 0x3E][reg]).w(d);
+    }
+
+    cmp_ax_imm16(imm) { return this.b(0x3D).w(imm); }
+    cmp_al_imm(imm)   { return this.b(0x3C, imm); }
+
+    // 89 /r: [r/m16] <- reg16, so `mov_r16_r16(dst, src)` copies src to dst.
+    mov_r16_r16(dst, src) {
+        return this.b(0x89, 0xC0 | ((src & 7) << 3) | (dst & 7));
+    }
+
+    // 81 /4 and 81 /7: AND r16, imm16 and CMP r16, imm16.
+    and_r16_imm16(reg, imm) { return this.b(0x81, 0xE0 | (reg & 7)).w(imm); }
+
+    // F7 /0: TEST r16, imm16.
+    test_r16_imm16(reg, imm) { return this.b(0xF7, 0xC0 | (reg & 7)).w(imm); }
+    cmp_r16_imm16(reg, imm) { return this.b(0x81, 0xF8 | (reg & 7)).w(imm); }
+    cmp_bx_imm16(imm) { return this.b(0x81, 0xFB).w(imm); }
+    cmp_cl_imm(imm)   { return this.b(0x80, 0xF9, imm); }
+    test_al_imm(imm)  { return this.b(0xA8, imm); }
+    test_ax_imm16(imm) { return this.b(0xA9).w(imm); }   // A9 iw
+
+    inc_moffs(d)    { return this.b(0xFF, 0x06).w(d); }              // FF /0
+    cmp_moffs_imm8(d, i) { return this.b(0x83, 0x3E).w(d).b(i); }   // 83 /7
+
+    int(n)  { return this.b(0xCD, n); }
+    jc(l)   { return this.b(0x72).rel8(l); }   // JB / JNAE
+    jnc(l)  { return this.b(0x73).rel8(l); }   // JAE / JNB
+    je(l)   { return this.b(0x74).rel8(l); }   // JZ
+    jne(l)  { return this.b(0x75).rel8(l); }   // JNZ
+    jbe(l)  { return this.b(0x76).rel8(l); }   // JNA
+    ja(l)   { return this.b(0x77).rel8(l); }   // JNBE
+    jmp(l)  { return this.b(0xEB).rel8(l); }
+    jmpl(l) { return this.b(0xE9).rel16(l); }
+    call(l) { return this.b(0xE8).rel16(l); }
+}
+
+export function self_test_labels()
+{
+    const labels = {};
+    const a = new Asm(SECTOR_SIZE);
+    const real_label = a.label.bind(a);
+    a.label = function(name)
+    {
+        real_label(name);
+        labels[name] = a.pos;
+        return a;
+    };
+    assemble(a);
+    return labels;
+}
+
+function assemble_self_test()
+{
+    const a = new Asm(SECTOR_SIZE);
+    assemble(a);
+    const code = a.link();
+
+    // The strings must not run into the 0x55AA signature at 510/511.
+    if(code[510] !== 0 || code[511] !== 0)
+    {
+        throw new Error("boot sector code and strings overlap the signature");
+    }
+
+    return { code: code.slice(0, SECTOR_SIZE) };
+}
+
+function assemble(a)
+{
+
+    // Every failure branches to one shared routine with the check's letter
+    // in AL. Inlining the routine thirteen times would not fit in a sector.
+    //
+    // The jump is emitted *inverted* -- "if the check passed, skip the
+    // failure" -- because the forward form needs a second jump over the
+    // failure block. That extra three bytes per check is, across thirteen
+    // checks, the difference between fitting in a sector and not.
+    const inverse = { jne: "je", je: "jne", jc: "jnc", ja: "jbe" };
+
+    const fail = (cc, tag) =>
+    {
+        a[inverse[cc]]("ok_" + tag);
+        a.mov_al(tag.charCodeAt(0));
+        a.jmpl("fail");
+        a.label("ok_" + tag);
+    };
+
+    // ---- entry --------------------------------------------------------
+    // A BIOS jumps here with DL = boot drive and interrupts disabled.
+    a.label("start");
+    a.cli();
+    a.xor_ax_ax();
+    a.mov_seg_ax(3);              // DS
+    a.mov_seg_ax(0);              // ES
+    a.mov_seg_ax(2);              // SS
+    a.mov_r16(4, 0x7000);         // SP
+    a.sti();
+    a.mov_r16(0, DATA_SEG);
+    a.mov_seg_ax(3);              // DS = working data
+
+    // ---- M: conventional memory ----------------------------------------
+    a.mov_ah(0x00);
+    a.int(0x12);
+    a.cmp_ax_imm16(512);
+    fail("jc", "M");            // fail only if memory is below 512 KiB
+
+    // ---- E: equipment word reports a floppy -----------------------------
+    a.mov_ah(0x11);
+    a.int(0x11);
+    a.test_al_imm(0x01);         // bit 0 = at least one floppy drive
+    fail("je", "E");
+
+    // ---- T: real-time clock date -----------------------------------------
+    // AH=02h (read date) returns CH=century, CL=year, DH=month, DL=day.
+    // AH=00h (read time) returns the time of day and has no century at all.
+    //
+    // The century is in *CH*, which is bits 8-15 of CX -- not in AX. Masking
+    // AX tests AH instead, and AH is left over from the `mov ah,02h` that
+    // issued the call on a BIOS that does not clear it. That made this check
+    // pass for the wrong reason against one BIOS and fail against another;
+    // running both through `examples/firmware-oracle.js` is what exposed it.
+    a.mov_ah(0x02);
+    a.int(0x1A);
+    a.test_r16_imm16(1, 0xFF00);  // CH = century, must be non-zero
+    fail("je", "T");
+
+    // DL is the day of month and must not be zero.
+    a.test_al_imm(0xFF);
+    fail("je", "T2");
+
+    // ---- R: disk reset --------------------------------------------------
+    a.mov_ah(0x00);
+    a.mov_dl(0x00);
+    a.int(0x13);
+    fail("jc", "R");
+
+    // ---- G: drive parameters --------------------------------------------
+    // AH=08h is the "describe this drive" call; AH=04h is verify, which a
+    // self-test has no reason to issue.
+    a.mov_ah(0x08);
+    a.mov_dl(0x00);
+    a.int(0x13);
+    fail("jc", "G");
+    // CL holds the sectors-per-track count; zero means the drive cannot be
+    // addressed even with the extensions.
+    a.cmp_cl_imm(0x3F);
+    fail("ja", "G2");
+
+    // ---- D: EDD install check -------------------------------------------
+    a.mov_ah(0x41);
+    a.mov_dl(0x00);
+    // The request carries BX=55AAh; the BIOS answers with BX=AA55h. They
+    // are deliberately different, which is the whole point of the check.
+    a.mov_r16(3, 0x55AA);        // BX = 55AAh
+    a.mov_r16(1, 0x0000);        // CX = 0000h
+    a.int(0x13);
+    fail("jc", "D");
+    a.cmp_bx_imm16(0xAA55);      // answer must be AA55h
+    fail("jne", "D2");
+
+    // ---- B: EDD read of LBA 0 through a disk address packet --------------
+    // Packet layout, per the INT 13h Extensions spec:
+    //   +0  size (byte)   +1  reserved    +2  sector count (word)
+    //   +4  buffer offset +6  buffer segment
+    //   +8  64-bit LBA (two 32-bit words)
+    // Note the buffer is addressed as segment:offset. Writing the offset
+    // into the segment field -- or deriving the segment from the offset --
+    // lands the read somewhere else entirely and the check that follows
+    // sees garbage.
+    a.mov_moffs_imm16(DAP + 0x00, 16);         // size = 16, reserved = 0
+    a.mov_moffs_imm16(DAP + 0x02, 1);          // sector count
+    a.mov_moffs_imm16(DAP + 0x04, BUFFER);     // buffer offset
+    a.mov_moffs_imm16(DAP + 0x06, DATA_SEG);   // buffer segment
+    a.mov_moffs_imm16(DAP + 0x08, 0);          // LBA low dword
+    a.mov_moffs_imm16(DAP + 0x0A, 0);           // LBA high dword
+    a.mov_moffs_imm16(DAP + 0x0C, 0);          // LBA, bits 32..63
+    a.mov_moffs_imm16(DAP + 0x0E, 0);          // LBA, bits 48..63
+    a.mov_ah(0x42);
+    a.mov_dl(0x00);
+    a.mov_r16(6, DAP);                        // SI = packet
+    a.int(0x13);
+    fail("jc", "B");
+
+    // ---- S: the sector read back is this boot sector ---------------------
+    // A word load of the 0x55AA signature yields AX = AA55h, so the *low*
+    // byte is 55h and the high byte is AAh. Comparing AL against AAh would
+    // fail against a perfectly good read.
+    a.mov_ax_moffs(BUFFER + 510);
+    a.cmp_al_imm(0x55);
+    fail("jne", "S");
+
+    // ---- 8: E820 system memory map ---------------------------------------
+    a.mov_r16(0, 0xE820);
+    a.mov_r16(3, 0);                          // BX = continuation
+    a.mov_r16(1, SMAP);                       // CX = buffer
+    a.int(0x15);
+    fail("jc", "8");
+
+    // ---- 0: the first entry describes memory at base 0 -------------------
+    a.cmp_moffs_imm8(SMAP + 8, 0);            // high dword of the base
+    fail("jne", "0");
+    a.mov_ax_moffs(SMAP);                     // low dword
+    a.cmp_ax_imm16(0);
+    fail("jne", "0b");
+
+    // ---- A: A20 query -----------------------------------------------------
+    a.mov_r16(0, 0x2402);
+    a.int(0x15);
+    fail("jc", "A");
+
+    // ---- C: video mode reports 80 columns --------------------------------
+    // AH=0Fh returns the column count in AH and the mode number in AL, so
+    // testing AL against 80 tests the wrong byte entirely. Mask AH out and
+    // compare CX, leaving AL alone.
+    a.mov_ah(0x0F);
+    a.int(0x10);
+    a.mov_r16_r16(1, 0);          // CX = AX
+    a.and_r16_imm16(1, 0xFF00);   // keep AH
+    a.cmp_r16_imm16(1, 80 << 8);   // 80 columns
+    fail("jne", "C");
+
+    // ---- Q: write a character to the screen ------------------------------
+    a.mov_ah(0x0E);
+    a.mov_al(0x51);                           // 'Q'
+    a.int(0x10);
+
+    // ---- every check passed -----------------------------------------------
+    a.jmpl("pass_tail");
+
+    // ---- shared failure routine -------------------------------------------
+    // AL holds the check letter. Print it, then print the failure banner
+    // from the inline table, then stop: a machine that has failed a BIOS
+    // self-test has nothing useful left to do.
+    a.label("fail");
+    a.mov_ah(0x0E);
+    a.int(0x10);
+    a.jmp("fail_tail");
+
+    // ---- puts: write the NUL-terminated string at DS:SI -------------------
+    a.label("puts");
+    a.lodsb();
+    a.or_al_al();
+    a.je("puts_done");
+    a.mov_ah(0x0E);
+    a.int(0x10);
+    a.jmpl("puts");
+    a.label("puts_done");
+    a.ret();
+
+    // ---- halt --------------------------------------------------------------
+    a.label("halt");
+    a.cli();
+    a.hlt();
+    a.b(0xEB, 0xFD);                          // jmp $
+
+    // ---- print a verdict ---------------------------------------------------
+    // lodsb reads through DS, and the inline strings live in the boot
+    // sector's own segment rather than the scratch data segment the checks
+    // used. Copying CS to DS rather than assuming 0000 matters because a
+    // BIOS may enter the sector as 0000:7C00 or as 07C0:0000 -- the same
+    // linear address, but only CS names the segment holding the strings.
+    a.label("pass_tail");
+    a.mov_ds_cs();
+    a.mov_si_label("msg_pass");
+    a.call("puts");
+    a.jmpl("halt");
+
+    a.label("fail_tail");
+    a.mov_ds_cs();
+    a.mov_si_label("msg_fail");
+    a.call("puts");
+    a.jmpl("halt");
+
+    // ---- inline strings ----------------------------------------------------
+    // These have to live inside the loaded sector: a BIOS reads 512 bytes
+    // and nothing else is available until the guest asks for it.
+    a.label("msg_pass");
+    a.ascii("RESULT: PASS");
+    a.label("msg_fail");
+    a.ascii("RESULT: FAIL");
+}

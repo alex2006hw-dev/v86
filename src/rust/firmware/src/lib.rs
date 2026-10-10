@@ -15,10 +15,14 @@
 //! The firmware is pure logic over the `Machine` trait, making it
 //! testable on the host without the full emulator.
 
+pub mod asm;
 pub mod backend;
 pub mod bda;
+pub mod debug;
 pub mod dispatch;
 pub mod eltorito;
+pub mod font;
+#[cfg(feature = "standalone")]
 pub mod ffi;
 pub mod int10;
 pub mod int13;
@@ -27,12 +31,16 @@ pub mod int15;
 pub mod int16;
 pub mod int17;
 pub mod int1a;
+pub mod irq;
 pub mod ivt;
 pub mod machine;
 pub mod post;
+pub mod rom;
 pub mod status;
 pub mod vbe;
 
-pub use dispatch::{bios_interrupt, Config, Firmware};
-pub use machine::{Machine, Reg, SegReg, Flag, KeyEvent, RtcReading};
-pub use post::run_post;
+pub use dispatch::{dispatch_service, firmware_service, Config, Firmware};
+pub use machine::{Flag, KeyEvent, Machine, Reg, RtcReading, SegReg};
+pub use post::{install_roms, run_post};
+pub use rom::{build_system_rom, build_vga_rom, SystemRom, VgaRom};
+pub use vbe::{NullVideoHost, VideoHost};

@@ -205,6 +205,19 @@ V86.prototype.continue_init = async function(emulator, options)
 
     var settings = {};
 
+    // "pcjs" selects the built-in firmware instead of a ROM image. It has
+    // to be copied explicitly: everything below copies known options by
+    // hand, so an unrecognised one would otherwise be silently dropped.
+    if(options.firmware)
+    {
+        settings.firmware = options.firmware;
+    }
+
+    if(options.firmware_trace)
+    {
+        settings.firmware_trace = true;
+    }
+
     const boot_order =
         options.boot_order ? options.boot_order :
         options.fda ? BOOT_ORDER_FD_FIRST :

@@ -17,6 +17,9 @@ pub const VIDEO_MONO_BASE: u32 = 0xB0000;
 pub fn handle_int10<M: Machine>(fw: &mut Firmware<M>) -> bool {
     let ah = fw.ah();
     match ah {
+        // INT 43h is a vector of its own, but callers reach it through
+        // the same ROM stub table, so AH=43h lands here too.
+        0x43 => font_request(fw),
         0x00 => set_video_mode(fw),
         0x01 => set_cursor_type(fw),
         0x02 => set_cursor_position(fw),
@@ -29,15 +32,38 @@ pub fn handle_int10<M: Machine>(fw: &mut Firmware<M>) -> bool {
         0x0A => write_char_only(fw),
         0x0E => tty_write(fw),
         0x0F => get_video_mode(fw),
-        _ => {
-            // VBE functions (AX=4F00h–4F09h) are handled by vbe.rs.
-            if fw.ax() >= 0x4F00 && fw.ax() <= 0x4F09 {
-                crate::vbe::handle_vbe(fw)
-            } else {
-                false
-            }
-        }
+        // VBE lives at AX=4F00h-4F0Bh and has its own dispatch, which
+        // needs the video chip.
+        0x4F => fw.with_video(crate::vbe::handle_vbe),
+        _ => false,
     }
+}
+
+/// True when AX is in the VBE service range.
+pub fn is_vbe(ax: u16) -> bool {
+    (0x4F00..=0x4F0B).contains(&ax)
+}
+
+/// INT 43h — return the character generator's far pointer.
+///
+/// The font lives in the video option ROM, so this only has to report
+/// where it is. SI gets the segment, DI the offset, ES:BP the linear
+/// address, and CX the number of characters, as DOS software expects.
+fn font_request<M: Machine>(fw: &mut Firmware<M>) -> bool {
+    let offset = fw
+        .vga_rom
+        .map(|v| v.font)
+        .unwrap_or(crate::rom::vbe_rom::FONT);
+    let segment = crate::rom::VGA_ROM_SEG;
+    let linear = (u32::from(segment) << 4) + u32::from(offset);
+    fw.machine.write_reg(crate::machine::Reg::Esi, u32::from(segment));
+    fw.set_di(offset);
+    fw.set_es(segment);
+    fw.machine.write_reg(crate::machine::Reg::Ebp, linear);
+    fw.set_cx(256);
+    fw.set_bx(16); // bytes per character
+    fw.set_cf(false);
+    true
 }
 
 /// AH=00h: set video mode.
@@ -360,6 +386,20 @@ fn get_video_mode<M: Machine>(fw: &mut Firmware<M>) -> bool {
     fw.set_bh(fw.video.page);
     fw.set_cf(false);
     true
+}
+
+/// Scroll the whole screen up by one line, filling with blanks.
+///
+/// Shared with the POST banner, which writes to the screen before any
+/// guest program could have set a scroll region.
+pub fn scroll_up_full<M: Machine>(fw: &mut Firmware<M>) {
+    let cols = fw.video.cols as u32;
+    let rows = fw.video.rows as u32;
+
+    if cols == 0 || rows < 2 {
+        return;
+    }
+    scroll_region(fw, 1, 0x07, 0, 0, rows - 1, cols - 1, true);
 }
 
 /// Clear the entire screen.

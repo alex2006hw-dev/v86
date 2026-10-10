@@ -25,14 +25,21 @@ pub const EQUIPMENT: u32 = 0x410;
 /// Memory size in KiB (INT 12h).
 pub const MEMORY_SIZE: u32 = 0x413;
 
-/// Keyboard shift flags: two bytes at 0x417/0x418.
+/// Keyboard shift flags: two bytes at 0x417/0x418. Bit 7 of the first
+/// byte is set while a Ctrl-Break (Ctrl+Pause) is pending.
 pub const KBD_SHIFT_FLAGS: u32 = 0x417;
-/// Keyboard buffer head/tail (offsets within segment 0x40).
+/// Lock-key and break flags: bit 6 Caps, bit 5 Num, bit 4 Scroll,
+/// bit 7 Ctrl-Break pending. LED state is the next byte, bits 0-2.
+pub const KBD_FLAGS: u32 = 0x418;
+/// Keyboard buffer head/tail. These hold segment-relative offsets into
+/// the BDA (0x41A..0x43E), exactly as on real hardware: software reads
+/// and writes them directly and compares against 0x41E to detect an
+/// empty buffer.
 pub const KBD_BUF_HEAD: u32 = 0x41A;
 pub const KBD_BUF_TAIL: u32 = 0x41C;
-/// Keyboard buffer: 16 words (ASCII, scancode) pairs.
-pub const KBD_BUF: u32 = 0x41E;
-pub const KBD_BUF_LEN: u32 = 32;
+/// Keyboard buffer: 16 (ASCII, scancode) pairs, starting here.
+pub const KBD_BUF: u16 = 0x41E;
+pub const KBD_BUF_LEN: u16 = 32;
 
 /// Floppy motor status byte.
 pub const FLOPPY_MOTOR: u32 = 0x43F;
@@ -50,8 +57,10 @@ pub const CRT_CURSOR: u32 = 0x450;
 /// 6845 CRTC base address: 0x3B4 (mono) or 0x3D4 (color).
 pub const CRT_6845_BASE: u32 = 0x463;
 
-/// Timer tick count since midnight (increments every 55ms).
+/// Timer tick count: 32-bit count at 0x46C, with a mirrored high byte
+/// at 0x470 that some software reads on its own.
 pub const TIMER_TICKS: u32 = 0x46C;
+pub const TIMER_TICKS_MIRROR: u32 = 0x470;
 /// Reset flag: 0x1234 on warm boot.
 pub const RESET_FLAG: u32 = 0x472;
 
@@ -117,17 +126,13 @@ pub fn kbd_tail(m: &mut dyn Machine) -> u16 {
 pub fn kbd_store(m: &mut dyn Machine, ascii: u8, scancode: u8) -> bool {
     let head = kbd_head(m);
     let tail = kbd_tail(m);
-    let next = if u32::from(tail) + 2 >= KBD_BUF + KBD_BUF_LEN {
-        KBD_BUF
-    } else {
-        (tail + 2) as u32
-    };
-    if next == u32::from(head) {
+    let next = kbd_advance(tail);
+    if next == head {
         return false; // full
     }
     m.write_u8(BDA_BASE + u32::from(tail), ascii);
     m.write_u8(BDA_BASE + u32::from(tail) + 1, scancode);
-    m.write_u16(KBD_BUF_TAIL, next as u16);
+    m.write_u16(KBD_BUF_TAIL, next);
     true
 }
 
@@ -141,20 +146,31 @@ pub fn kbd_fetch(m: &mut dyn Machine) -> Option<(u8, u8)> {
     }
     let ascii = m.read_u8(BDA_BASE + u32::from(head));
     let scancode = m.read_u8(BDA_BASE + u32::from(head) + 1);
-    let next = if u32::from(head) + 2 >= KBD_BUF + KBD_BUF_LEN {
-        KBD_BUF
-    } else {
-        (head + 2) as u32
-    };
-    m.write_u16(KBD_BUF_HEAD, next as u16);
+    let next = kbd_advance(head);
+    m.write_u16(KBD_BUF_HEAD, next);
     Some((ascii, scancode))
 }
 
 /// Reset the keyboard buffer to empty.
 pub fn kbd_clear(m: &mut dyn Machine) {
-    m.write_u16(KBD_BUF_HEAD, KBD_BUF as u16);
-    m.write_u16(KBD_BUF_TAIL, KBD_BUF as u16);
+    m.write_u16(KBD_BUF_HEAD, KBD_BUF);
+    m.write_u16(KBD_BUF_TAIL, KBD_BUF);
 }
+
+/// Next head/tail position after consuming or producing two bytes,
+/// wrapping at the end of the buffer.
+fn kbd_advance(cursor: u16) -> u16 {
+    let next = u32::from(cursor) + 2;
+    if next >= u32::from(KBD_BUF) + u32::from(KBD_BUF_LEN) {
+        KBD_BUF
+    } else {
+        next as u16
+    }
+}
+
+/// One past the last byte of the keyboard buffer, as a segment-relative
+/// BDA offset. Only used as a wrap sentinel.
+pub const KBD_BUF_END: u16 = KBD_BUF + KBD_BUF_LEN;
 
 /// Read the cursor position (row, col) of a display page.
 pub fn cursor_pos(m: &mut dyn Machine, page: u8) -> (u8, u8) {

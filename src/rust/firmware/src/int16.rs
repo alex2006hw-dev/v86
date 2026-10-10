@@ -35,7 +35,7 @@ fn read_key<M: Machine>(fw: &mut Firmware<M>) -> bool {
     loop {
         if let Some(event) = fw.machine.poll_key() {
             if event.pressed {
-                let (ascii, scancode) = scancode_to_ascii(event.scancode, fw.keyboard.shift_flags);
+                let (ascii, scancode) = scancode_to_ascii(event.scancode, fw.machine.read_u8(bda::KBD_SHIFT_FLAGS));
                 // Store in the BIOS keyboard buffer.
                 bda::kbd_store(&mut fw.machine, ascii, scancode);
                 fw.set_al(ascii);
@@ -73,7 +73,8 @@ fn peek_key<M: Machine>(fw: &mut Firmware<M>) -> bool {
 
 /// AH=02h: get keyboard shift flags.
 fn get_shift_flags<M: Machine>(fw: &mut Firmware<M>) -> bool {
-    fw.set_al(fw.keyboard.shift_flags);
+    let shift = fw.machine.read_u8(bda::KBD_SHIFT_FLAGS);
+    fw.set_al(shift);
     fw.set_cf(false);
     true
 }
@@ -107,7 +108,8 @@ fn peek_key_extended<M: Machine>(fw: &mut Firmware<M>) -> bool {
 
 /// AH=12h: get shift flags extended.
 fn get_shift_flags_extended<M: Machine>(fw: &mut Firmware<M>) -> bool {
-    fw.set_al(fw.keyboard.shift_flags);
+    let shift = fw.machine.read_u8(bda::KBD_SHIFT_FLAGS);
+    fw.set_al(shift);
     fw.set_ah(0);
     fw.set_cf(false);
     true

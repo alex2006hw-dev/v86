@@ -8,7 +8,7 @@
 use crate::backend::{
     BlockBackend, BlockInfo, DriveKind, Geometry, SECTOR_SIZE,
 };
-use crate::machine::{Machine, Reg};
+use crate::machine::Machine;
 use crate::backend::Int13Status;
 use crate::status::{self, INVALID_FUNCTION, SUCCESS};
 use crate::{Firmware};
@@ -158,6 +158,10 @@ impl<M: Machine> Firmware<M> {
 //  all register access goes through the firmware state.
 pub fn handle_int13<M: Machine>(fw: &mut Firmware<M>) {
     let ah = fw.ah();
+    fw.trace(
+        crate::debug::tag::DISK,
+        format!("INT 13h AH={:02X}h DL={:02X}h", ah, fw.dl()),
+    );
     match ah {
         0x00 => reset_disk_system(fw),
         0x01 => get_last_status(fw),
@@ -515,27 +519,54 @@ pub const EDD_CAP_EXTENDED_ACCESS: u16 = 1 << 0; // AH=42h-44h,47h,48h
 pub const EDD_CAP_CONTROL: u16 = 1 << 1; // AH=45h-47h,48h
 pub const EDD_CAP_64BIT: u16 = 1 << 2; // 64-bit LBA addressing
 
-/// EDD version reported in DH (EDD 3.0).
-pub const EDD_VERSION: u8 = 0x20;
+/// EDD version reported by AH=41h, as major in AH and minor in DH.
+///
+/// EDD 3.0 is the right number to claim: it is the version that added the
+/// 64-bit LBA field to the disk address packet, which is exactly what
+/// `EDD_CAP_64BIT` below promises.
+pub const EDD_VERSION_MAJOR: u8 = 0x03;
+pub const EDD_VERSION_MINOR: u8 = 0x00;
 
 /// AH=41h: EDD installation check. BX must be 0x55AAh.
 fn edd_install_check<M: Machine>(fw: &mut Firmware<M>) {
     if fw.bx() != 0x55AA {
         // BX != 55AAh: not a valid installation check.
+        fw.trace(
+            crate::debug::tag::DISK,
+            format!("EDD check rejected: BX={:04X}", fw.bx()),
+        );
         fw.int13_error_nodrive(INVALID_FUNCTION);
         return;
     }
     if fw.drive_in_dl().is_none() {
+        fw.trace(crate::debug::tag::DISK, "EDD check: no such drive");
         return;
     }
-    // Report EDD 3.0 with extended access, control
-    // functions and 64-bit addressing.
+    // Report EDD 3.0 with extended access, control functions and 64-bit
+    // addressing.
+    //
+    // AH is the *major version of the Extensions spec*, not the classic
+    // INT 13h success code. Writing SUCCESS (0) there tells a caller the
+    // BIOS implements version 0, which is not a version that exists.
+    // DL is the number of drives, not the drive that was asked about, so it
+    // has to be counted rather than echoed back.
+    let drive_count = fw.drives.drives.len().min(0xFF) as u8;
     fw.set_cf(false);
-    fw.set_ah(SUCCESS);
+    fw.set_ah(EDD_VERSION_MAJOR);
     fw.set_bx(0xAA55);
     fw.set_cx(EDD_CAP_EXTENDED_ACCESS | EDD_CAP_CONTROL | EDD_CAP_64BIT);
-    // DH = EDD version.
-    fw.machine.write_reg8(Reg::Edx, true, EDD_VERSION);
+    fw.set_dh(EDD_VERSION_MINOR);
+    fw.set_dl(drive_count);
+    fw.trace(
+        crate::debug::tag::DISK,
+        format!(
+            "EDD ok: AH={:02X}h BX={:04X}h CX={:04X}h DX={:04X}h",
+            fw.ah(),
+            fw.bx(),
+            fw.cx(),
+            fw.dx()
+        ),
+    );
 }
 
 /// Disk Address Packet (DAP) at DS:SI.
