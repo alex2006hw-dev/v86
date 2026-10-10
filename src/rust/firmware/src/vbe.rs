@@ -233,7 +233,7 @@ fn vbe_get_mode_info<M: Machine>(fw: &mut Firmware<M>) -> bool {
 /// AX=4F02h: set VBE mode (BX=mode, bit 14 = LFB, bit 15 = preserve).
 fn vbe_set_mode<M: Machine>(fw: &mut Firmware<M>) -> bool {
     let mode = fw.bx();
-    let use_lfb = mode & 0x4000 != 0;
+    let _use_lfb = mode & 0x4000 != 0;
     let mode_num = mode & 0x3FFF;
 
     if !VBE_MODES.iter().any(|m| m.mode == mode_num) {

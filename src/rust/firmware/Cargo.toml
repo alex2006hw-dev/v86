@@ -7,6 +7,15 @@ license = "MIT"
 
 [lib]
 path = "src/lib.rs"
+# "lib" so the firmware can be unit-tested and embedded in the main v86
+# crate; "cdylib" so Node.js can load it as a WASI module and drive it
+# against the PCjs x86 CPU.
+crate-type = ["lib", "cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
 
 [profile.test]
 opt-level = 1

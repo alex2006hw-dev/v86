@@ -6,7 +6,6 @@
 //! If guest software re-vectors an interrupt elsewhere, the firmware
 //! declines and the guest handler runs (matching real hardware).
 
-use crate::backend::DriveKind;
 use crate::bda;
 use crate::eltorito::BootInfo;
 use crate::int13::DriveTable;

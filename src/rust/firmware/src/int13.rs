@@ -8,7 +8,7 @@
 use crate::backend::{
     BlockBackend, BlockInfo, DriveKind, Geometry, SECTOR_SIZE,
 };
-use crate::machine::{Machine, Reg, SegReg};
+use crate::machine::{Machine, Reg};
 use crate::backend::Int13Status;
 use crate::status::{self, INVALID_FUNCTION, SUCCESS};
 use crate::{Firmware};

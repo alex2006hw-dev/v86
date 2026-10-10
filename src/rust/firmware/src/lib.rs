@@ -19,6 +19,7 @@ pub mod backend;
 pub mod bda;
 pub mod dispatch;
 pub mod eltorito;
+pub mod ffi;
 pub mod int10;
 pub mod int13;
 pub mod int14;

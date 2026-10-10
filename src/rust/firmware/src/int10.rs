@@ -159,7 +159,6 @@ fn scroll_region<M: Machine>(
     up: bool,
 ) {
     let cols = fw.video.cols as u32;
-    let rows = fw.video.rows as u32;
     let base = VIDEO_COLOR_BASE;
     let lines = lines as u32;
 

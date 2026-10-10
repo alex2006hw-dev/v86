@@ -368,6 +368,28 @@ rust-test: $(RUST_FILES)
 rust-test-intensive:
 	QUICKCHECK_TESTS=100000000 make rust-test
 
+# ---------------------------------------------------------------------------
+# PCjs-derived firmware (MIT). See src/rust/firmware and tests/firmware/.
+#
+# The firmware crate is pure logic over a Machine trait, so it is built for
+# wasm32-wasip1 and driven from Node against the real PCjs x86 CPU. This needs
+# only the wasm32-wasip1 rustup target, unlike the browser build above.
+# ---------------------------------------------------------------------------
+FIRMWARE_WASM=build/wasm32-wasip1/release/v86_firmware.wasm
+
+firmware-build:
+	cd src/rust/firmware && cargo build --release --target wasm32-wasip1 --lib
+	ls -l $(FIRMWARE_WASM)
+
+# Firmware unit tests run on the host target and need no wasm toolchain.
+firmware-unit-test:
+	cd src/rust/firmware && cargo test
+
+# Boot the firmware in the PCjs CPU under Node and run the BIOS self-test
+# boot sector. Set FW_TRACE_INT=1 to dump register state per interrupt.
+firmware-test: firmware-build
+	./tests/firmware/run.mjs
+
 api-tests: build/v86-debug.wasm
 	./tests/api/clean-shutdown.js
 	./tests/api/state.js
@@ -381,7 +403,7 @@ api-tests: build/v86-debug.wasm
 	#./tests/api/reboot-buildroot.js # https://github.com/copy/v86/issues/636
 	./tests/api/pic.js
 
-all-tests: eslint kvm-unit-test qemutests qemutests-release jitpagingtests api-tests nasmtests nasmtests-force-jit rust-test tests expect-tests
+all-tests: eslint kvm-unit-test qemutests qemutests-release jitpagingtests api-tests nasmtests nasmtests-force-jit rust-test firmware-unit-test firmware-test tests expect-tests
 	# Skipping:
 	# - devices-test (hangs)
 
@@ -420,4 +442,4 @@ doc:
 denodoc:
 	deno doc --html --name="v86 API" --output=./docs/api ./v86.d.ts
 
-.PHONY: tests
+.PHONY: tests firmware-build firmware-unit-test firmware-test

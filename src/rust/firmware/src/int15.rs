@@ -34,12 +34,10 @@ pub fn handle_int15<M: Machine>(fw: &mut Firmware<M>) -> bool {
 /// AX=E820h: get system memory map (ES:DI -> buffer, EBX=continuation).
 fn e820_memory_map<M: Machine>(fw: &mut Firmware<M>) -> bool {
     let addr = crate::machine::phys(fw.es(), fw.di() as u32);
-    let ebx = fw.machine.read_reg(crate::machine::Reg::Ebx) as u32;
+    let ebx = fw.machine.read_reg(crate::machine::Reg::Ebx);
 
-    // Each entry is 24 bytes: 8 base, 8 length, 4 type, 4 ACPI.
-    let entry_size = 24;
-    let max_entries = 3; // We support up to 3 entries.
-
+    // Each SMAP entry is a 24-byte descriptor: 8 base, 8 length, 4 type,
+    // 4 ACPI extended attributes.
     if ebx as usize >= fw.e820.len() {
         // No more entries.
         fw.set_cf(true);
