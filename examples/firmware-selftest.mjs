@@ -244,6 +244,12 @@ export class Asm
     or_eax_imm8(v)  { return this.b(0x83, 0xC8, v); }
     and_eax_imm8(v) { return this.b(0x83, 0xE8, v); }
     lgdt_moffs(d)   { return this.b(0x0F, 0x01, 0x10).w(d); }   // lgdt [d]
+
+    // 0F 01 /0 is SGDT and /1 is SIDT, with a disp16 operand when ModRM is
+    // mod=00, reg=N, rm=101. The CS-relative forms (segment override 0x2E)
+    // address the boot sector's own segment.
+    sgdt_cs(d)      { return this.b(0x2E, 0x0F, 0x01, 0x05).w(d); }
+    sidt_cs(d)      { return this.b(0x2E, 0x0F, 0x01, 0x0D).w(d); }
     jmp_far(off, sel) { return this.b(0xEA).w(off).w(sel); }
 
     /** `jmp <label>:<sel>` -- the offset is a label address. */
