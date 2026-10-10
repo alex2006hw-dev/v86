@@ -269,6 +269,86 @@ pub extern "C" fn v86_firmware_add_floppy(sectors: u32) -> i32 {
     }
 }
 
+/// Trampoline for [`HostImage`], which stores the machine as an opaque
+/// pointer rather than knowing its type.
+///
+/// # Safety
+///
+/// `ctx` must be a pointer to the `EmulatorMachine` owned by the firmware
+/// instance, and must stay valid for as long as the drive exists.
+unsafe fn host_image_read(ctx: *mut (), image: u8, offset: u64, buf: &mut [u8]) -> bool {
+    let machine = &mut *(ctx as *mut EmulatorMachine);
+    machine.read_host_image(image, offset, buf)
+}
+
+/// Register a host-backed block device and return its INT 13h drive number.
+///
+/// `image` is the host's handle for the image, `kind` is 0 for a hard disk
+/// and 1 for a CD-ROM, and `total_sectors` is the image length in units of
+/// `sector_size` (512 for a hard disk, 2048 for a CD).
+///
+/// Unlike [`v86_firmware_add_floppy`] the bytes are **not** copied into the
+/// firmware: a CD image is hundreds of megabytes, and v86 hands images over
+/// as JavaScript buffers that would have to be copied into the wasm heap to
+/// be addressable. Sectors are pulled from the host on demand through
+/// [`Machine::read_host_image`] instead.
+///
+/// Returns the drive number, or -1 on failure.
+#[no_mangle]
+pub extern "C" fn v86_firmware_add_drive(image: u32, kind: u32, total_sectors: u32, sector_size: u32) -> i32 {
+    use crate::firmware::backend::{
+        BlockInfo, DriveKind, Geometry, HostImage, SECTOR_SIZE,
+    };
+
+    let sector_size = if sector_size == 2048 { 2048 } else { SECTOR_SIZE };
+    let total = total_sectors as u64;
+    let kind = if kind == 1 { DriveKind::CdRom } else { DriveKind::HardDisk };
+
+    unsafe {
+        let fw = firmware_ptr();
+        if fw.is_null() || total == 0 {
+            return -1;
+        }
+
+        // A hard disk is addressed by CHS as well as LBA, so it needs a
+        // plausible geometry. EDD callers use LBA and never see this; the
+        // classic INT 13h calls that do would otherwise have nothing to
+        // report. 16 heads and 63 sectors per track is the conventional
+        // choice and covers any image up to about 2 TiB.
+        let heads = 16u32;
+        let sectors_per_track = 63u32;
+        let cylinders = (total / (heads as u64 * sectors_per_track as u64)).clamp(1, 0x3FF) as u32;
+        let geometry = Geometry {
+            cylinders,
+            heads,
+            sectors_per_track,
+        };
+
+        let number = match kind {
+            DriveKind::CdRom => (*fw).drives.next_cd(),
+            _ => (*fw).drives.next_hd(),
+        };
+
+        let machine: *mut EmulatorMachine = &mut (*fw).machine;
+        (*fw).drives.add(
+            number,
+            Box::new(HostImage::new(
+                BlockInfo {
+                    kind,
+                    geometry,
+                    sector_size,
+                    total_sectors: total,
+                    removable: kind == DriveKind::CdRom,
+                },
+                image as u8,
+                machine as *mut (),
+                host_image_read,
+            )),
+        );
+        number as i32
+    }
+}
+
 /// Address of a drive's image buffer, or null. The host may read and
 /// write it directly, which keeps image loading a single memory copy.
 #[no_mangle]
@@ -578,6 +658,17 @@ impl Machine for EmulatorMachine {
 
     fn peek_stack_pointer(&self) -> u32 {
         unsafe { crate::cpu::misc_instr::get_stack_pointer(0) as u32 }
+    }
+
+    fn read_host_image(&mut self, image: u8, byte_offset: u64, buf: &mut [u8]) -> bool {
+        unsafe {
+            crate::cpu::cpu::js::read_host_image(
+                image as i32,
+                byte_offset as f64,
+                buf.as_mut_ptr() as i32,
+                buf.len() as i32,
+            ) != 0
+        }
     }
 
     fn patch_saved_flags(&mut self) {

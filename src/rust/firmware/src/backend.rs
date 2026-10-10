@@ -130,6 +130,12 @@ pub trait BlockBackend {
         false
     }
 
+    /// True when the medium refuses writes, so the caller can answer
+    /// without attempting one.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     fn eject(&mut self) -> Result<(), Int13Status> {
         Err(super::status::INVALID_COMMAND)
     }
@@ -149,6 +155,88 @@ pub trait BlockBackend {
     /// `write_sectors`. Only `RamDisk` overrides this.
     fn downcast_ram_disk(&mut self) -> Option<&mut RamDisk> {
         None
+    }
+}
+
+/// A block backend whose bytes stay in the host and are fetched on demand.
+///
+/// A 1.44 MiB floppy is cheap enough to copy into the firmware's own memory,
+/// and [`RamDisk`] does exactly that. A 671 MiB CD image is not: v86 hands
+/// images over as ordinary JavaScript buffers that Rust cannot address, so
+/// copying one would mean growing the wasm heap by most of a gigabyte and
+/// holding it for the lifetime of the machine.
+///
+/// This backend keeps the geometry and instead pulls each sector from the
+/// host as it is needed. The cost is one host call per sector read, which is
+/// invisible next to the emulated CPU work around it.
+///
+/// # Safety
+///
+/// `ctx` must stay valid for as long as the backend is reachable. It is a
+/// pointer to the `Machine` owned by the firmware, which lives in a
+/// `static mut` and is never moved after `init_firmware` assigns it. The
+/// drives are rebuilt whenever a new machine is installed, so the pointer is
+/// always re-established before use.
+pub struct HostImage {
+    info: BlockInfo,
+    /// Which host image this is, opaque to the firmware.
+    image: u8,
+    ctx: *mut (),
+    read: unsafe fn(*mut (), u8, u64, &mut [u8]) -> bool,
+}
+
+impl HostImage {
+    pub fn new(
+        info: BlockInfo,
+        image: u8,
+        ctx: *mut (),
+        read: unsafe fn(*mut (), u8, u64, &mut [u8]) -> bool,
+    ) -> HostImage
+    {
+        HostImage {
+            info,
+            image,
+            ctx,
+            read,
+        }
+    }
+
+    pub fn image(&self) -> u8
+    {
+        self.image
+    }
+}
+
+impl BlockBackend for HostImage {
+    fn info(&self) -> BlockInfo
+    {
+        self.info
+    }
+
+    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Int13Status>
+    {
+        let offset = lba * self.info.sector_size as u64;
+        let ok = unsafe { (self.read)(self.ctx, self.image, offset, buf) };
+        if ok {
+            Ok(())
+        } else {
+            Err(super::status::SECTOR_NOT_FOUND)
+        }
+    }
+
+    fn write_sectors(&mut self, _lba: u64, _buf: &[u8]) -> Result<(), Int13Status>
+    {
+        // The host owns these bytes. Writing back would need a second call
+        // into the host, and nothing the emulator exposes today routes guest
+        // writes into a `buffer.js` image anyway.
+        Err(super::status::WRITE_PROTECTED)
+    }
+
+    /// True for optical media, which report write-protected without needing
+    /// to be asked.
+    fn is_read_only(&self) -> bool
+    {
+        self.info.kind == DriveKind::CdRom
     }
 }
 

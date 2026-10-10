@@ -311,20 +311,173 @@ so the shipped bundle size is unmeasured. Recorded as BUILD-1 in
 | `examples/firmware-debug.js` | ROM/IVT/BDA/trace-ring/screen diagnostic |
 | `examples/firmware-oracle.js` | Runs the same sector against a real BIOS |
 | `examples/firmware-service-probe.mjs` | Records what a BIOS returns for a service |
+| `examples/cd-boot.js` | Boots a disk or CD image |
+| `examples/build-test-iso.mjs` | Builds a minimal El Torito ISO for the CD path |
+| `tools/httpfs-v86-server.py` | Serves httpfs-backed files over plain HTTP |
 | `TechDebt.md`, `docs/firmware-selection.md` | Analysis and debt register |
 
-## 11. Not done
+## 11. Hard disk and CD-ROM support
+
+### 11.1 The blocker
+
+`v86_firmware_add_floppy` was the only drive-registration entry point, so
+`DriveKind::HardDisk` and `DriveKind::CdRom` were never populated and
+`boot_from_cd()` was unreachable dead code.
+
+The obvious fix — copy the image into the firmware — does not survive contact
+with a real ISO. The Debian netinst image is 640 MiB; v86 hands images over as
+JavaScript buffers that Rust cannot address, so copying one means growing the
+wasm heap by most of a gigabyte and holding it for the machine's lifetime.
+
+So drives are registered **by reference**. `HostImage` keeps the geometry and
+pulls each sector across the host boundary as it is needed:
+
+```
+guest INT 13h → firmware → Machine::read_host_image → js::read_host_image
+             → CPU.prototype.firmware_read_image → JS buffer → wasm memory
+```
+
+`dest` is a Rust slice pointer — an address in the wasm linear memory — so the
+copy is a direct `Uint8Array.set`. One host call per sector read, invisible
+next to the emulated CPU work around it. Floppies keep the copy-in path;
+1.44 MiB is not worth a callback.
+
+| Added | |
+|---|---|
+| `backend.rs` | `HostImage`, a `BlockBackend` that reads through the host |
+| `machine.rs` | `Machine::read_host_image`, defaulting to "unsupported" |
+| `cpu.rs` | the `read_host_image` wasm import |
+| `fw_adapter.rs` | `v86_firmware_add_drive(image, kind, sectors, sector_size)` |
+| `cpu.js` | `register_firmware_image`, `firmware_read_image` |
+| `starter.js` | the import |
+| `lib.js` | Node can now fetch `http:` URLs, which it previously could not |
+
+Drives are numbered the way hardware is: floppies `0x00`-, hard disks
+`0x80`-, CD-ROMs `0xE0`-, with 2048-byte sectors for optical media.
+
+### 11.2 Three real bugs in El Torito, each fatal on its own
+
+None of this had ever executed. El Torito boot was dead code that looked
+alive, and the only test for it asserted that a *blank* image was rejected.
+
+```rust
+&sector[1..7] == b"CD001"      // six bytes compared against five -- never true
+```
+
+`"CD001"` is five bytes at offsets 1..6. `parse_boot_info` could therefore
+only ever return `NotIso`.
+
+```rust
+boot_system_id[21..]           // overlaps the signature
+```
+
+`"EL TORITO SPECIFICATION"` is 23 characters, so the blank remainder of the
+32-byte identifier field starts at 23. Starting at 22 rejected every
+otherwise-valid boot record.
+
+```rust
+// the catalogue sector was assumed to open with a signature
+```
+
+It does not. It opens with the **validation entry**: header id `0x01`,
+platform, identifier string, key bytes `55 AA` at offsets 30-31, and a
+sixteen-word sum that must be zero. Debian's isohybrid boot info block at
+LBA 1119 is laid out exactly this way. An implementation that expects
+`EL TORITO SPECIFICATION` at offset 0 will not read any real image.
+
+Each is now pinned by a test that builds a bootable image in memory and
+asserts it parses — the case that was missing.
+
+### 11.3 What the ISOs in `~/iphone/cdrom` actually are
+
+| | Debian netinst | NetBSD 11.0 |
+|---|---|---|
+| MBR / hybrid | yes, isohybrid | no |
+| El Torito boot record at LBA 17 | yes | yes |
+| Boot catalogue | LBA 1119, valid; default entry is no-emulation, 4 sectors from LBA 3344 | none usable |
+
+Debian is **hybrid**: it boots from its isohybrid MBR or from El Torito.
+`examples/cd-boot.js` reports which structures it found before trying, so a
+failure says which path was expected.
+
+I first concluded that neither image had an El Torito catalogue. That was
+wrong: I searched for the `EL TORITO SPECIFICATION` string, which real
+catalogues do not contain, and had the default entry's sector-count field one
+byte early. Both were the same mistake the firmware had made — finding it in
+the firmware is what sent me back into the images.
+
+### 11.4 Serving the images over HTTP, through httpfs
+
+v86 loads images with `fetch()` in the browser but only `fs` under Node, so
+nothing served over HTTP was testable from a script. `src/lib.js` now
+fetches when handed an `http:`/`https:`/`file:` URL under Node.
+
+`tools/httpfs-v86-server.py` bridges httpfs to plain HTTP. The httpfs server
+speaks a JSON RPC for POSIX operations and rejects any request without an
+`HttpFsClient` user agent, so it cannot be fetched directly. The bridge opens
+each file with `OP_OPEN`, reads ranges with `OP_READ`, and serves
+`GET`/`HEAD` with `Range`. **The bytes genuinely come from httpfs**; only the
+protocol in front is translated.
+
+```console
+$ python -m httpfs.server 8099 /localdisk/home/dev/work/iphone/cdrom/
+$ tools/httpfs-v86-server.py --port 8100
+$ node examples/cd-boot.js http://127.0.0.1:8100/debian-12.1.0-i386-netinst.iso
+```
+
+Verified byte-identical to the local files at six offsets, including the MBR
+signature and the El Torito boot record.
+
+### 11.5 What boots
+
+| Image | Device | Result |
+|---|---|---|
+| `test-hd.img` (self-test as MBR) | `hda` | **boots**, self-test runs |
+| `hd-512.img`, 512 MiB | `hda` | **boots** — size is not the limit |
+| `test-boot.iso` | `cdrom` | **boots via El Torito**, no-emulation |
+| `test-boot.iso` over httpfs | `cdrom` | **boots**, interpreter and JIT |
+| `debian-12.1.0-i386-netinst.iso` | `cdrom` | firmware parses its catalogue and loads its boot image; Debian's loader then stalls |
+| `debian-12.1.0-i386-netinst.iso` | `hda` | same |
+| `NetBSD-11.0-i386.iso` | `cdrom` | no usable boot catalogue |
+
+The Debian stall is **not** a firmware regression, and that was checked rather
+than assumed:
+
+- SeaBIOS fails on the same image as `hda` from a local file, ending at the
+  same `cs:eip` with a garbage signature at `0000:7C00`.
+- The firmware's part demonstrably works: the trace shows it reading LBA 16
+  (primary volume descriptor), LBA 17 (boot record) and LBA 1119
+  (catalogue), loading the no-emulation image and jumping to it. The guest
+  then performs 16 further INT 13h reads of its own before stopping.
+- SeaBIOS could not load the 640 MiB CD through the bridge within 150 s,
+  because that path copies the image. The by-reference design streams it in
+  ~20 s — an asymmetry that is a side benefit, not the point.
+
+Debian's early boot loader reaches a state v86 does not carry it past, under
+any BIOS. Filed as **BOOT-1** in `TechDebt.md`.
+
+### 11.6 New examples and tooling
+
+| | |
+|---|---|
+| `examples/cd-boot.js` | boots a disk or CD image, reporting which structures it found |
+| `examples/build-test-iso.mjs` | builds a 21-sector El Torito ISO around the self-test boot sector, giving the CD path a controlled subject with no ISO tooling installed |
+| `tools/httpfs-v86-server.py` | httpfs → plain HTTP, with `Range` |
+
+## 12. Not done
 
 Listed so nothing here reads as more finished than it is:
 
 - `architecture.md` is referenced by `TechDebt.md` but has not been written.
-- **No CD-ROM reaches the firmware.** `v86_firmware_add_floppy` is the only
-  drive-registration entry point, so `boot_from_cd()` is unreachable dead
-  code. CD-1/CD-2 in `TechDebt.md`.
 - **No USB**, in the emulator or the BIOS, and no WebUSB mapping. USB-1
   through USB-3.
-- **No loadable option-ROM infrastructure**, which both of the above need.
-  ROM-1.
+- **No loadable option-ROM infrastructure**, which USB-2 needs. ROM-1.
+- **`INT 13h AX=4B00h/4B02h` are still absent.** The firmware boots from a CD
+  at POST, but a loader that wants to boot from CD later has nothing to call.
+  CD-2 in `TechDebt.md`.
+- **Debian's and NetBSD's installers do not complete boot**, though the
+  firmware parses and loads their El Torito images correctly. BOOT-1 in
+  `TechDebt.md`.
 - **Nothing runs in CI.** TEST-1/TEST-3.
 - **SeaBIOS does not boot under the v86 JIT** (§6). It needs
   `FW_NO_JIT=1`. This is a v86 bug, not a firmware one, and it could not be

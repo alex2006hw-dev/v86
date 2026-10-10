@@ -210,6 +210,19 @@ pub trait Machine {
     /// The current real-mode stack pointer value, for diagnostics.
     fn peek_stack_pointer(&self) -> u32;
 
+    /// Copy part of a host-owned image into `buf`.
+    ///
+    /// `image` identifies the image by the number the host gave it,
+    /// `byte_offset` is from the start of the image, and `buf.len()` is the
+    /// number of bytes wanted. Return `true` on success.
+    ///
+    /// Only hosts with images too large to copy into memory implement this;
+    /// the default says "no", and the drive then reports a failed read.
+    fn read_host_image(&mut self, image: u8, byte_offset: u64, buf: &mut [u8]) -> bool {
+        let _ = (image, byte_offset, buf);
+        false
+    }
+
     /// Copy the carry flag into the FLAGS image the trap interrupt pushed.
     ///
     /// This is not optional. `INT n` pushes FLAGS *before* the handler

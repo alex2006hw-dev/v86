@@ -94,8 +94,13 @@ fn read_iso_sector(
 }
 
 /// Check that a volume descriptor has the ISO 9660 signature.
+///
+/// "CD001" is five bytes at offsets 1..6. Slicing 1..7 compared six bytes
+/// against five, which is never equal, so every volume descriptor was
+/// rejected and `parse_boot_info` could only ever return `NotIso` -- El Torito
+/// boot was dead code that looked alive.
 fn is_volume_descriptor(sector: &[u8; ISO_SECTOR]) -> bool {
-    &sector[1..7] == b"CD001"
+    &sector[1..6] == b"CD001"
 }
 
 /// Parse the El Torito boot information from an ISO image.
@@ -133,11 +138,15 @@ pub fn parse_boot_info(
             continue; // not a boot record
         }
         let boot_system_id = &vd[7..39];
+        // "EL TORITO SPECIFICATION" is 23 bytes, so the remainder of the
+        // 32-byte identifier field starts at 23 -- not at 21, which
+        // overlapped the last two characters of the signature and rejected
+        // every boot record that was otherwise perfectly good.
         let is_el_torito = boot_system_id
             .iter()
             .zip(b"EL TORITO SPECIFICATION".iter())
             .all(|(a, b)| *a == *b)
-            && boot_system_id[21..].iter().all(|&c| c == 0 || c == b' ');
+            && boot_system_id[23..].iter().all(|&c| c == 0 || c == b' ');
         if !is_el_torito {
             continue;
         }

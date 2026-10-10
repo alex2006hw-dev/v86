@@ -553,6 +553,129 @@ fn test_eltorito_not_iso() {
     assert!(matches!(result, Err(ElToritoError::NotIso)));
 }
 
+/// Build a minimal El Torito image: a primary volume descriptor, a boot
+/// record pointing at a catalogue, and a catalogue with a no-emulation
+/// default entry.
+fn make_bootable_iso(catalog_lba: u32, image_lba: u32) -> RamDisk {
+    let sectors = 64usize;
+    let info = BlockInfo {
+        kind: DriveKind::CdRom,
+        geometry: v86_firmware::backend::CD_ROM_GEOMETRY,
+        sector_size: CD_SECTOR_SIZE,
+        total_sectors: sectors as u64,
+        removable: true,
+    };
+    let mut data = vec![0u8; sectors * 2048];
+
+    let put = |data: &mut Vec<u8>, lba: usize, f: &dyn Fn(&mut [u8])| {
+        let mut s = vec![0u8; 2048];
+        s[0] = if lba == 16 { 0x01 } else if lba == 17 { 0x00 } else { 0xFF };
+        s[1..6].copy_from_slice(b"CD001");
+        s[6] = 0x01;
+        f(&mut s);
+        data[lba * 2048..lba * 2048 + 2048].copy_from_slice(&s);
+    };
+
+    put(&mut data, 16, &|_| {});
+    put(&mut data, 17, &|s| {
+        s[7..7 + 23].copy_from_slice(b"EL TORITO SPECIFICATION");
+        s[0x47..0x4B].copy_from_slice(&catalog_lba.to_le_bytes());
+        s[0x4B] = 0x00; // no emulation
+    });
+    put(&mut data, 18, &|_| {});
+    put(&mut data, catalog_lba as usize, &|s| {
+        // The catalogue sector opens with the validation entry itself: no
+        // signature. That is how real images do it -- Debian's isohybrid
+        // boot info block at LBA 1119 is a validation entry with nothing
+        // before it -- and it is what this firmware expects.
+        //
+        // Every byte not set below stays zero, including the identifier
+        // string: any stray character there changes the checksum and the
+        // entry is rejected.
+        let mut v = [0u8; 32];
+        v[0] = 0x01;                       // header id
+        v[1] = 0x00;                       // platform: 80x86
+        v[30] = 0x55;                      // key bytes
+        v[31] = 0xAA;
+        // The sixteen little-endian words must sum to zero. Word 0 is the
+        // header id (1) and word 15 is 0xAA55 (43605), so word 7 supplies
+        // 65536 - 43605 - 1 = 21930, which is 0x55AA.
+        v[14] = 0xAA;
+        v[15] = 0x55;
+        s[0..32].copy_from_slice(&v);
+
+        let mut e = [0u8; 32];
+        e[0] = 0x88;                       // boot indicator
+        e[1] = 0x00;                       // no emulation
+        e.write_uint16_le(2, 0x07C0);      // load segment
+        e.write_uint16_le(6, 1);           // virtual sector count
+        e.write_uint32_le(8, image_lba);   // load RBA
+        s[32..64].copy_from_slice(&e);
+    });
+    data[image_lba as usize * 2048 + 510] = 0x55;
+    data[image_lba as usize * 2048 + 511] = 0xAA;
+
+    RamDisk::new(info, data)
+}
+
+/// A tiny little-endian writer, so the test does not need unsafe.
+trait LeWrite {
+    fn write_uint16_le(&mut self, offset: usize, value: u16);
+    fn write_uint32_le(&mut self, offset: usize, value: u32);
+}
+
+impl LeWrite for [u8] {
+    fn write_uint16_le(&mut self, offset: usize, value: u16)
+    {
+        self[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn write_uint32_le(&mut self, offset: usize, value: u32)
+    {
+        self[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+#[test]
+fn test_eltorito_parses_a_bootable_image() {
+    // Regression test. `is_volume_descriptor` compared six bytes of the
+    // sector against the five bytes of "CD001", so it was never true and
+    // every bootable image was rejected as NotIso. Only the negative case
+    // was ever tested, which is why nothing caught it.
+    let mut cd = make_bootable_iso(20, 21);
+    let info = eltorito::parse_boot_info(&mut cd).expect("a bootable image must parse");
+
+    assert_eq!(info.catalog_lba, 20);
+    assert_eq!(info.default_entry.media_type, MEDIA_NO_EMULATION);
+    assert_eq!(info.default_entry.load_rba, 21);
+    assert_eq!(info.default_entry.load_segment, 0x07C0);
+}
+
+#[test]
+fn test_eltorito_rejects_a_bad_catalogue_checksum() {
+    let mut cd = make_bootable_iso(20, 21);
+    // Corrupt the key bytes the entry must carry.
+    cd.data[20 * 2048 + 31] ^= 0xFF;
+    let result = eltorito::parse_boot_info(&mut cd);
+    assert!(
+        matches!(result, Err(ElToritoError::InvalidCatalog)),
+        "a bad catalogue checksum must be refused, got {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_eltorito_rejects_a_missing_boot_record() {
+    // No boot record: the volume descriptor scan must reach the terminator
+    // and give up rather than reading a catalogue from wherever.
+    let mut cd = make_bootable_iso(20, 21);
+    let sector = 17 * 2048;
+    cd.data[sector..sector + 2048].fill(0);
+    cd.data[sector + 18] = 0xFF; // terminator
+
+    let result = eltorito::parse_boot_info(&mut cd);
+    assert!(matches!(result, Err(ElToritoError::NotElTorito)));
+}
+
 #[test]
 fn test_eltorito_emulated_media_sectors() {
     assert_eq!(eltorito::emulated_media_sectors(MEDIA_1440K_FLOPPY), Some(2880));

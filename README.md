@@ -102,12 +102,31 @@ IRQ 0, 1, 6, 8 and 12 are wired to the timers, keyboard and diskette. POST
 fills the BDA and the drive table, and publishes a conventional-memory size,
 an equipment word and a system memory map.
 
+### Disks and CD-ROMs
+
+Hard disks and CD-ROMs are registered with the firmware and are not copied
+into it. v86 hands images over as JavaScript buffers that Rust cannot
+address, so a 640 MiB ISO would otherwise mean growing the wasm heap by most
+of a gigabyte; instead the firmware asks the host for each sector as it needs
+it.
+
+```javascript
+new V86({ firmware: "pcjs", cdrom: { url: "debian.iso" } });   // El Torito
+new V86({ firmware: "pcjs", hda:   { url: "disk.img" } });     // MBR
+```
+
+El Torito boot works, including no-emulation images. Debian's installer and
+NetBSD's are **not** fully working: the firmware reads their catalogues and
+loads their boot images correctly, but their loaders then stall — and they
+stall identically under SeaBIOS, so this is a v86 limitation rather than a
+firmware one. See BOOT-1 in [`TechDebt.md`](TechDebt.md).
+
 ### What is not finished
 
 Worth reading before relying on it:
 
-- **Floppy only.** The firmware currently receives floppy drives; hard disks
-  and CD-ROMs are not registered with it, so El Torito boot cannot run yet.
+- **No `INT 13h AX=4B00h/4B02h`**, so a loader cannot boot from CD after POST
+  has run; only POST's own CD boot works.
 - **No loadable option ROMs**, so a driver cannot be guest-visible code.
 - **No USB**, in the emulator or the BIOS.
 - **No PCI BIOS, APIC or ACPI tables.**
@@ -300,6 +319,36 @@ Four Node scripts, all runnable in a clean checkout with no disk images.
 | [`firmware-debug.js`](examples/firmware-debug.js) | Dumps the state a failure leaves behind: reset vector, both ROM images, the IVT, the BDA, the trap ring, the firmware's trace log and the guest screen. |
 | [`firmware-oracle.js`](examples/firmware-oracle.js) | Boots the same boot sector against SeaBIOS or Bochs, so a difference between the two runs is a firmware difference rather than a guest bug. Needs `FW_NO_JIT=1`. Divergence is expected and explained on stderr — see below. |
 | [`firmware-service-probe.mjs`](examples/firmware-service-probe.mjs) | Calls one service, records the registers a BIOS returns, and prints them. Settles a disagreement about a specification by measurement. Needs `FW_NO_JIT=1` against a real BIOS. |
+| [`cd-boot.js`](examples/cd-boot.js) | Boots a disk or CD image, reporting which structures it found first so a failure says which path was expected. |
+| [`build-test-iso.mjs`](examples/build-test-iso.mjs) | Builds a 21-sector El Torito ISO around the self-test boot sector, giving the CD path a controlled subject. |
+
+```console
+$ node examples/build-test-iso.mjs test-boot.iso
+$ FW_DEVICE=cdrom node examples/cd-boot.js test-boot.iso
+WorkAgent
+v86 permissive firmware
+Memory: 32768 KB
+Drives: 1 cd
+ERESULT: FAIL
+```
+
+`ERESULT: FAIL` is the expected verdict there: the self-test's check **E**
+wants a floppy, and this boot has only a CD. Check `D` is likewise stricter
+than SeaBIOS, which refuses EDD on floppies entirely.
+
+#### Serving images over HTTP
+
+`tools/httpfs-v86-server.py` serves a directory over plain HTTP, reading the
+bytes through an [httpfs](https://github.com/httpfs/httpfs) server. The
+httpfs server speaks a JSON RPC that v86 cannot fetch, so the bridge
+translates it and adds `Range` support; the bytes themselves come from
+httpfs.
+
+```console
+$ python -m httpfs.server 8099 /path/to/images/
+$ tools/httpfs-v86-server.py --port 8100
+$ node examples/cd-boot.js http://127.0.0.1:8100/debian-12.1.0-i386-netinst.iso
+```
 
 ```console
 $ node examples/firmware.js

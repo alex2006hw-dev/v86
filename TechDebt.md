@@ -27,8 +27,8 @@ that reports success to a Windows 95 installer is worse than an honest
 
 | ID | Area | Status | Severity |
 |---|---|---|---|
-| **CD-1** | **CD-ROM never reaches the firmware** | Wired | **High** |
-| **CD-2** | **`INT 13h AX=4B00h/4B02h` boot-and-emulation services missing** | Absent | **High** |
+| **CD-2** | **`INT 13h AX=4B00h/4B02h` absent** — POST boots from CD, a loader cannot | Absent | Medium |
+| **BOOT-1** | **Debian/NetBSD installers do not complete boot, under any BIOS** | Broken | High |
 | **CD-3** | El Torito `terminate emulation` is a no-op | Stub | Medium |
 | **CD-4** | No ATAPI `IDENTIFY` (`INT 15h AX=4F06h`) | Absent | Medium |
 | **CD-5** | El Torito boot catalog not in the boot-config table | Absent | Low |
@@ -36,7 +36,6 @@ that reports success to a Windows 95 installer is worse than an honest
 | **USB-1** | **No USB device emulation in v86 at all** | Absent | **High** |
 | **USB-2** | **No BIOS-side USB driver or mass-storage stack** | Absent | **High** |
 | **USB-3** | **No WebUSB host↔guest mapping** | Absent | **High** |
-| **DEV-1** | Drive registration is floppy-only | Absent | High |
 | **DEV-2** | No device-change / hot-plug notification | Absent | Low |
 | **HOST-1** | Trap ABI has no room for async or bulk transfer | Absent | Medium |
 | **TEST-1** | Boot test is green, but nothing runs it | Wired | Medium |
@@ -53,64 +52,10 @@ that reports success to a Windows 95 installer is worse than an honest
 
 ## CD-ROM: booting from CD-ROM
 
-The guest-facing half of this (El Torito parsing, the three emulation
-media types, the CD-as-floppy and CD-as-HDD shims) is written and has
-unit tests. The host-facing half — getting the CD *into* the firmware,
-and offering the INT 13h services a real loader calls — is not. Net
-effect today: `boot_from_cd()` is unreachable dead code, and a CD-ROM
-guest can only reach the image if something else reads it for it.
-
-### CD-1 — The CD-ROM never reaches the firmware
-
-`v86_firmware_add_floppy` (`src/rust/fw_adapter.rs:223`) is the *only*
-drive-registration entry point in the host ABI, and the only call site
-is `src/cpu.js:1798`, which handles `fda`/`fdb`. The firmware's
-`DriveKind::HardDisk` and `DriveKind::CdRom` variants
-(`src/rust/firmware/src/backend.rs:13`) are therefore never populated,
-so `boot_from_cd()` (`src/rust/firmware/src/post.rs:407`) always returns
-`false` at `first_of_kind(DriveKind::CdRom)`.
-
-What already works, and is worth not breaking:
-
-- `eltorito.rs` parses the volume descriptor, boot record, validation
-  entry, initial/default entry, and section headers.
-- `post.rs` implements all four media types: no-emulation (load and
-  jump), 1.2/1.44/2.88 MB floppy emulation, and hard-disk emulation.
-- `CdEmulationBackend` presents an emulated CD as a plain block device.
-
-**Why deferred:** it is only reachable once DEV-1 is done, and DEV-1 is
-blocked on the ownership question below.
-
-**To finish:**
-
-1. Generalise `add_floppy` to `v86_firmware_add_drive(kind, sectors,
-   is_cd, sector_size)` and return the firmware drive number. Floppy
-   stays a thin wrapper so the existing ABI and tests do not churn.
-2. Register `ide_config[0][0]`/`ide_config[1][0]` when `is_cdrom` is
-   true, and the IDE masters otherwise, assigning BIOS drive numbers
-   (floppies 0x00–, hard disks 0x80–, CD-ROMs 0xE0+).
-3. Decide the ownership model. This is the actual blocker. The
-   firmware backend wants a `Box<dyn BlockBackend>` over a contiguous
-   buffer, but v86's IDE device owns a `buffer.js` that can be *replaced
-   at runtime* by `settings`, by state restore, or by a UI action.
-   Pick one:
-   - **Re-register on every change** — the firmware queries the host for
-     the current buffer pointer per access (`drive_ptr`/`drive_len`
-     already exist per drive). Simplest, and it survives the buffer
-     being swapped; costs an FFI call per sector read.
-   - **Copy the image into firmware-owned memory at registration** —
-     fast, but pins up to hundreds of MiB and goes stale the moment the
-     user swaps the image.
-   - **Borrow with a generation counter** — revalidate on access,
-     rebuild the backend if the generation moved.
-4. Thread the buffer snapshot ordering already used for floppies
-   (`src/cpu.js:1039-1061`, `firmware_boot_drives` is captured *before*
-   `new IO(this)` detaches the disk buffers — the same trap applies
-   here).
-
-**Done when:** `node examples/cdrom-boot.js` boots a hand-built El Torito
-ISO of each of the four media types and reaches its loader, with
-`DriveKind::CdRom` non-empty in a firmware trace dump.
+Hard disks and CD-ROMs now reach the firmware, and El Torito boot works:
+no-emulation images boot, verified against a purpose-built ISO and against
+Debian's real catalogue. What is left is the part a *loader* needs when it
+wants to boot from CD after POST has already run.
 
 ### CD-2 — INT 13h AH=4B00/4B02 are missing
 
@@ -342,10 +287,6 @@ with one test per transport.
 
 ## Plumbing and ABI
 
-### DEV-1 — Drive registration is floppy-only
-
-The general case behind CD-1. See CD-1 step 1. **Severity:** High.
-
 ### DEV-2 — No device-change / hot-plug notification
 
 `src/cpu.js:730-745` shows the IDE device being *reconstructed* during a
@@ -382,6 +323,38 @@ without the firmware reading each byte individually.
 ---
 
 ## Tests
+
+### BOOT-1 — Debian's installer does not complete boot, under any BIOS
+
+**Status:** Broken. **Severity:** High.
+
+```
+$ FW_DEVICE=cdrom node examples/cd-boot.js debian-12.1.0-i386-netinst.iso
+... firmware parses the catalogue and loads the boot image, then stops
+```
+
+The firmware's half demonstrably works — the trace shows it reading LBA 16
+(primary volume descriptor), LBA 17 (boot record) and LBA 1119 (catalogue),
+loading the no-emulation image and jumping to it, after which the guest
+performs 16 further INT 13h reads of its own before stopping.
+
+**Not a firmware regression**, checked rather than assumed: SeaBIOS fails on
+the same image attached as `hda` from a local file, ending at the same
+`cs:eip` with a garbage signature at `0000:7C00`. Whatever state Debian's
+early loader reaches, v86 does not carry it past, and that is true of the
+BIOS this work replaces.
+
+Not yet diagnosed. The guest stops without another read, so it is executing
+rather than waiting on I/O; the candidates are a device v86 does not emulate
+that the loader probes for, or a timing assumption that never satisfies.
+
+Note that SeaBIOS could not *load* a 640 MiB CD through
+`tools/httpfs-v86-server.py` within 150 s, because that path copies the
+image into wasm memory. The by-reference drive design streams it in ~20 s,
+so this is at least not the same problem twice.
+
+**Done when:** `debian-12.1.0-i386-netinst.iso` reaches an installer menu,
+with SeaBIOS and the built-in firmware behaving the same.
 
 ### TEST-1 — The boot test is green, but nothing runs it
 

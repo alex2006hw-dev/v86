@@ -411,7 +411,11 @@ fn boot_from_cd<M: Machine>(fw: &mut Firmware<M>) -> bool {
     };
     // Parse El Torito if not already done.
     if fw.boot_info.is_none() {
-        if parse_eltorito(fw, number).is_err() {
+        if let Err(error) = parse_eltorito(fw, number) {
+            fw.trace(
+                tag::BOOT,
+                &format!("CD 0x{:02X}: no El Torito boot record ({:?})", number, error),
+            );
             return false;
         }
     }

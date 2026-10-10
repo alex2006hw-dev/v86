@@ -71,6 +71,13 @@ export function V86(options)
         "get_rand_int": function() { return get_rand_int(); },
         "stop_idling": function() { return cpu.stop_idling(); },
 
+        // Copy image bytes out of a host buffer into wasm memory. The firmware
+        // calls this instead of holding a copy of a disk or CD image, which
+        // would be hundreds of megabytes.
+        "read_host_image": function(image, byte_offset, dest, len) {
+            return cpu.firmware_read_image(image, byte_offset, dest, len);
+        },
+
         "io_port_read8": function(addr) { return cpu.io.port_read8(addr); },
         "io_port_read16": function(addr) { return cpu.io.port_read16(addr); },
         "io_port_read32": function(addr) { return cpu.io.port_read32(addr); },

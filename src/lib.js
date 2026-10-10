@@ -545,6 +545,41 @@ if(typeof XMLHttpRequest === "undefined" ||
      */
     load_file = async function(filename, options, n_tries)
     {
+        // A URL means "fetch it", even under Node. The browser branch below
+        // already does this through XMLHttpRequest, so without this the Node
+        // harness cannot do what the browser does -- which makes it
+        // impossible to test anything served over HTTP from a script.
+        if(typeof fetch === "function" && /^(https?|file):\/\//.test(filename))
+        {
+            try
+            {
+                const response = await fetch(filename);
+
+                if(!response.ok)
+                {
+                    throw new Error("HTTP " + response.status + " for " + filename);
+                }
+
+                const result = options.as_json ? await response.json() : await response.arrayBuffer();
+
+                options.done && options.done(result);
+                return;
+            }
+            catch(error)
+            {
+                if(n_tries > 0)
+                {
+                    setTimeout(function()
+                    {
+                        load_file(filename, options, n_tries - 1);
+                    }, 100);
+                    return;
+                }
+
+                throw error;
+            }
+        }
+
         if(!fs)
         {
             fs = await get_fs();

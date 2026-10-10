@@ -364,6 +364,7 @@ CPU.prototype.wasm_patch = function()
     // is not "pcjs" these stay unused and SeaBIOS is loaded instead.
     this.firmware_init = this.wm.exports["v86_firmware_init"];
     this.firmware_add_floppy = this.wm.exports["v86_firmware_add_floppy"];
+    this.firmware_add_drive = this.wm.exports["v86_firmware_add_drive"];
     this.firmware_drive_ptr = this.wm.exports["v86_firmware_drive_ptr"];
     this.firmware_drive_len = this.wm.exports["v86_firmware_drive_len"];
     this.firmware_set_rtc = this.wm.exports["v86_firmware_set_rtc"];
@@ -1040,9 +1041,13 @@ CPU.prototype.init = function(settings, device_bus)
 
     if(settings.firmware === "pcjs")
     {
-        this.firmware_boot_drives = ["fda", "fdb"]
+        // Floppies are small enough for the firmware to hold its own copy.
+        // Hard disks and CD-ROMs are not -- a single CD image runs to hundreds
+        // of megabytes -- so those are registered by reference and read
+        // across the host boundary on demand. See load_firmware.
+        this.firmware_boot_drives = ["fda", "fdb", "hda", "hdb", "cdrom"]
             .map(name => settings[name] && settings[name].buffer &&
-                { type: name, buffer: settings[name].buffer.slice(0) })
+                { type: name, buffer: settings[name].buffer })
             .filter(Boolean);
     }
 
@@ -1785,12 +1790,20 @@ CPU.prototype.load_firmware = function(settings, boot_drives)
         return false;
     }
 
+    this.firmware_images = [];
+
     for(var i = 0; i < (boot_drives || []).length; i++)
     {
         var drive = boot_drives[i];
 
-        if(drive.type !== "fda" || !drive.buffer)
+        if(!drive.buffer)
         {
+            continue;
+        }
+
+        if(drive.type !== "fda")
+        {
+            this.register_firmware_image(drive);
             continue;
         }
 
@@ -1820,6 +1833,89 @@ CPU.prototype.load_firmware = function(settings, boot_drives)
     }
 
     return true;
+};
+
+/**
+ * Register a hard disk or CD-ROM with the firmware by reference.
+ *
+ * The image stays where the host put it; the firmware asks for sectors by
+ * handle when it needs them, so nothing large is ever copied.
+ *
+ * @param {{type: string, buffer: ArrayBuffer|Uint8Array}} drive
+ * @return {boolean} true if the firmware accepted the drive
+ */
+CPU.prototype.register_firmware_image = function(drive)
+{
+    if(!this.firmware_add_drive)
+    {
+        return false;
+    }
+
+    var bytes = drive.buffer.byteLength || drive.buffer.length;
+    var is_cd = drive.type === "cdrom";
+
+    // A CD image is a sequence of 2048-byte sectors; a hard disk of 512.
+    // Deriving the count from the length is what lets an ISO and a raw disk
+    // image share this path.
+    var sector_size = is_cd ? 2048 : 512;
+    var sectors = Math.floor(bytes / sector_size);
+
+    if(sectors < 1)
+    {
+        return false;
+    }
+
+    var image = this.firmware_images.length;
+    this.firmware_images.push(drive.buffer);
+
+    var number = this.firmware_add_drive(image, is_cd ? 1 : 0, sectors, sector_size);
+
+    if(number < 0)
+    {
+        this.firmware_images.pop();
+        return false;
+    }
+
+    dbg_log("Firmware: " + drive.type + " as INT 13h drive 0x" + number.toString(16) +
+        " = " + sectors + " x " + sector_size + " bytes (image " + image + ")");
+    return true;
+};
+
+/**
+ * Copy part of a firmware image into wasm memory.
+ *
+ * The firmware's `read_host_image` import lands here. `dest` is an address
+ * in the wasm linear memory -- a Rust slice pointer -- so this is a direct
+ * write into the firmware's sector buffer.
+ *
+ * @param {number} image index into `firmware_images`
+ * @param {number} byte_offset from the start of the image
+ * @param {number} dest wasm linear address to write at
+ * @param {number} len number of bytes to copy
+ * @return {number} 1 on success, 0 on failure
+ */
+CPU.prototype.firmware_read_image = function(image, byte_offset, dest, len)
+{
+    var buffer = this.firmware_images[image];
+
+    if(!buffer)
+    {
+        return 0;
+    }
+
+    var start = Math.floor(byte_offset);
+
+    if(start < 0 || start + len > buffer.byteLength)
+    {
+        return 0;
+    }
+
+    // Read the source through its own buffer each time: the wasm memory
+    // grows during device setup, which detaches any view taken earlier.
+    var source = new Uint8Array(buffer, start, len);
+    var target = new Uint8Array(this.wasm_memory.buffer, dest, len);
+    target.set(source);
+    return 1;
 };
 
 CPU.prototype.load_bios = function()

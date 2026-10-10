@@ -35,6 +35,21 @@ mod wasm {
 pub mod js {
     #[link(wasm_import_module = "env")]
     extern "C" {
+        /// Copy image bytes out of a host buffer into wasm memory.
+        ///
+        /// `dest` is an address in the wasm linear memory (a Rust slice
+        /// pointer), which the host can write through. Returns 1 on success.
+        ///
+        /// v86 hands images over as JavaScript buffers, which Rust cannot
+        /// address, so a 671 MiB CD image has to be read across this boundary
+        /// a sector at a time rather than copied in whole.
+        pub fn read_host_image(
+            image: i32,
+            byte_offset: f64,
+            dest: i32,
+            len: i32,
+        ) -> i32;
+
         pub fn cpu_exception_hook(interrupt: i32) -> bool;
         pub fn microtick() -> f64;
         pub fn run_hardware_timers(acpi_enabled: bool, t: f64) -> f64;
