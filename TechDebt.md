@@ -400,9 +400,78 @@ interrupts disabled, because a software `int 0x19` clears IF in the CPU core
 and nothing re-enabled it. Every real BIOS enables interrupts before
 transferring control. That fix is correct but did **not** resolve this.
 
-Not yet diagnosed. The remaining differences between this handoff and
-SeaBIOS's are the GDT/IDT state, the memory map handed over through
-`INT 15h AX=E820h`, and general register contents.
+Not yet diagnosed, but narrowed. Disassembling FreeNOS's first stage (2 KiB
+at CD LBA 3800) shows it is a hand-written 16-bit loader that:
+
+1. Reads the El Torito load RBA and sector count from a header at `cs:[bx+9]`
+   and `cs:[bx+0xd]`, then computes `ceil(count / 2048)` — confirming the
+   sector count is in **512-byte virtual sectors** and is rounded up to whole
+   CD sectors, which is what `boot_from_cd` already does.
+2. Loads the rest of itself with **`INT 13h AH=42h`**, building a disk
+   address packet **on the stack at `SS:SP`** with `DS=0` and `SI=SP`, and a
+   buffer at `0000:0800`.
+3. Far-jumps to `0000:0820`.
+
+The `jmp 0x820:0x0` at `0x7C6E` is a **far** jump, and in real mode that
+would land at `0x8A0`, not `0x820`. So the loader is already in 32-bit
+protected mode by then: it runs its BIOS call through a far call to a 16-bit
+segment, then returns by popping the segment registers — which is exactly
+where the `POP ES` #GP lands. The failure is in the protected-mode entry, not
+the disk layer.
+
+### Ruled out
+
+- **The CD path** — FreeNOS as `hda` via its hybrid MBR panics identically.
+- **Host I/O** — every firmware read returns success; bytes at `0000:7C00`
+  match the ISO.
+- **A20** — v86 does not implement A20 masking at all. Port `0x92` is a stub
+  that stores a byte and does nothing (`src/cpu.js`), and the PS2 controller
+  output port is explicitly a placeholder (`src/ps2.js:705`). Memory is
+  always flat, so A20 cannot explain a guest that works under one BIOS and
+  not another.
+- **The BIOS's part of the checklist** — the canonical sequence before
+  protected mode (disable interrupts and NMI, enable A20, load the GDT, set
+  `CR0.PE`, far jump) is the *loader's* job. The BIOS's job is narrower.
+
+### Leading hypothesis, not proven
+
+`lookup_segment_selector` raises `OutsideOfTableLimit` when
+`selector.descriptor_offset() > *gdtr_size`, and `gdtr_size` is only ever set
+by `lgdt` (or reset to 0). `lgdt` is:
+
+```rust
+let size = return_on_pagefault!(safe_read16(addr));
+```
+
+On a page fault `return_on_pagefault!` returns **from the function**, leaving
+`*gdtr_size` at whatever it was — 0 after reset. Every subsequent segment
+load then #GPs, which is precisely the observed failure. A guest that never
+notices, because the fault happens at the "pop all the segments" idiom.
+
+Whether that is *this* bug is unproven. It is a real weakness and the first
+thing to check.
+
+### The experiment that would settle it
+
+A synthetic reproducer, independent of any guest: extend the self-test boot
+sector with `lgdt` → `mov cr0` → far jump → `pop es`, about sixty bytes.
+Under the built-in firmware it should either pass or produce a minimal,
+attributable failure — which separates "v86 cannot enter protected mode from
+a BIOS boot sector" from "FreeNOS needs something specific".
+
+### Reference material
+
+[EDK II](https://github.com/tianocore/edk2) is **BSD-2-Clause-Patent** — the
+same permissive class as v86's own base — and has no AI contribution policy,
+so it is usable as a reference. `OvmfPkg/Library/LoadLinuxLib/LinuxGdt.c` is
+the most directly relevant file: OVMF's own legacy-style handoff to a
+protected-mode kernel installs a GDT via `LGDT` and a **null IDT** via
+`LIDT`, then far-jumps through selector `0x10`. Worth comparing against our
+handoff state. It is reference only — nothing has been copied.
+
+EDK II cannot replace this firmware: it is UEFI, with no real-mode
+`INT 10h`/`INT 13h`, so it would not serve DOS or Windows 3.x. See
+`docs/firmware-selection.md`.
 
 **Done when:** FreeNOS reaches its `login:` prompt on the built-in firmware,
 with SeaBIOS as the oracle for the same image.
