@@ -448,16 +448,54 @@ On a page fault `return_on_pagefault!` returns **from the function**, leaving
 load then #GPs, which is precisely the observed failure. A guest that never
 notices, because the fault happens at the "pop all the segments" idiom.
 
-Whether that is *this* bug is unproven. It is a real weakness and the first
-thing to check.
+Whether that is *this* bug is unproven, and the reproducer below went
+further.
 
-### The experiment that would settle it
+### What the synthetic reproducer showed
 
-A synthetic reproducer, independent of any guest: extend the self-test boot
-sector with `lgdt` → `mov cr0` → far jump → `pop es`, about sixty bytes.
-Under the built-in firmware it should either pass or produce a minimal,
-attributable failure — which separates "v86 cannot enter protected mode from
-a BIOS boot sector" from "FreeNOS needs something specific".
+A ~60-byte protected-mode entry was added to the self-test boot sector:
+build a GDT with 32-bit code and data descriptors, `LGDT` it, set `CR0.PE`,
+far jump through selector `0x08`, `pop` the data selector into ES.
+
+It panics — **under SeaBIOS as well as under this firmware**, at
+`src/rust/cpu/cpu.rs:856`, which is not the segment-load path at all:
+
+```rust
+if interrupt_nr << 3 | 7 > *idtr_size {
+    panic!("Unimplemented: #GP handler");
+}
+```
+
+That is `trigger_gp` failing to deliver the #GP it just raised, because
+**`idtr_size` is 0**. Neither firmware installs an IDT, so *any* fault taken
+in protected mode turns into a hard panic with no diagnostic. That is a
+useful thing to know on its own: the absence of an IDT is what makes these
+failures look like emulator bugs rather than firmware ones.
+
+It also means the reproducer does **not** yet reproduce BOOT-2. Its exit
+sequence clears `CR0.PE` and then far-jumps to **selector `0x0000`**, which is
+the null selector and a `#GP` on real hardware as well — a bug in the test,
+not a finding about v86. It needs a 16-bit descriptor and the correct
+far-jump-then-clear-PE order.
+
+Ruled out along the way: **the IF-at-handoff change is not the cause.**
+Reverting it (leaving the loader with interrupts disabled) changes nothing —
+still `cpu.rs:856`. That change stays; it matches SeaBIOS and is correct,
+but it is unrelated to this failure.
+
+### The next experiment
+
+Fix the reproducer: give the GDT a 16-bit code descriptor, far jump to it,
+*then* clear `CR0.PE`, and pop the segment registers on the way back. If it
+then passes under both BIOSes, the protected-mode entry is sound and
+BOOT-2 is about something FreeNOS specifically needs. If it still faults,
+the faulting instruction will finally be identifiable, because the IDT
+absence will no longer be masking it.
+
+A second, cheaper change is worth making regardless: **install a GDT and an
+IDT at handoff.** `OvmfPkg/Library/LoadLinuxLib/LinuxGdt.c` does exactly
+this for a protected-mode kernel, and without an IDT every protected-mode
+fault is an emulator panic with no diagnostic.
 
 ### Reference material
 

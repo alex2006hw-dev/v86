@@ -238,6 +238,22 @@ export class Asm
     inc_moffs(d)    { return this.b(0xFF, 0x06).w(d); }              // FF /0
     cmp_moffs_imm8(d, i) { return this.b(0x83, 0x3E).w(d).b(i); }   // 83 /7
 
+    // ---- protected-mode / control-register forms ----
+    mov_eax_cr0()   { return this.b(0x0F, 0x20, 0xC0); }
+    mov_cr0_eax()   { return this.b(0x0F, 0x22, 0xC0); }
+    or_eax_imm8(v)  { return this.b(0x83, 0xC8, v); }
+    and_eax_imm8(v) { return this.b(0x83, 0xE8, v); }
+    lgdt_moffs(d)   { return this.b(0x0F, 0x01, 0x10).w(d); }   // lgdt [d]
+    jmp_far(off, sel) { return this.b(0xEA).w(off).w(sel); }
+
+    /** `jmp <label>:<sel>` -- the offset is a label address. */
+    jmp_far_label(name, sel) {
+        this.fixups.push({ at: this.pos + 1, name, kind: "absolute" });
+        return this.b(0xEA).w(0).w(sel);
+    }
+    push_imm32(v)   { return this.b(0x68).w(v); }
+    pop_es()        { return this.b(0x1F); }
+
     int(n)  { return this.b(0xCD, n); }
     jc(l)   { return this.b(0x72).rel8(l); }   // JB / JNAE
     jnc(l)  { return this.b(0x73).rel8(l); }   // JAE / JNB
@@ -312,6 +328,56 @@ function assemble(a)
     a.sti();
     a.mov_r16(0, DATA_SEG);
     a.mov_seg_ax(3);              // DS = working data
+
+    // ---- P: a protected-mode entry, as a real boot loader does one ----
+    //
+    // This is the smoke test for BOOT-2. FreeNOS and HelenOS both die here
+    // under this firmware -- `POP ES` in 32-bit mode raises the #GP that
+    // v86 has no handler for -- while SeaBIOS boots them to a login prompt.
+    // The test reproduces the shape of what those loaders do, so a failure
+    // here is attributable without a guest in the picture at all:
+    //
+    //   build a GDT with a 32-bit code and data descriptor
+    //   LGDT it, set CR0.PE, far jump through selector 0x08
+    //   pop the data selector into ES   <- the instruction that faults
+    //   clear CR0.PE and far jump back to 16-bit
+    //
+    // The GDT lives in the scratch segment. Descriptors are built with
+    // immediate stores rather than emitted as data, so the test stays a few
+    // dozen bytes and the sector keeps fitting in 512.
+    const GDT = 0x0400;
+    const PSEUDO = GDT + 0x18;
+
+    // null descriptor at GDT+0x00 is already zero -- the scratch segment is
+    // cleared by the data-segment setup below.
+    // code descriptor at GDT+0x08: base 0, limit 0xFFFFF, G=1, D=1, P=1, ring 0, code
+    a.mov_moffs_imm16(GDT + 0x08, 0xFFFF);
+    a.mov_moffs_imm16(GDT + 0x0A, 0x0000);
+    a.mov_moffs_imm16(GDT + 0x0C, 0x009A);
+    a.mov_moffs_imm16(GDT + 0x0E, 0x00CF);
+    // data descriptor at GDT+0x10: same, but data
+    a.mov_moffs_imm16(GDT + 0x10, 0xFFFF);
+    a.mov_moffs_imm16(GDT + 0x12, 0x0000);
+    a.mov_moffs_imm16(GDT + 0x14, 0x0092);
+    a.mov_moffs_imm16(GDT + 0x16, 0x00CF);
+    // pseudo-descriptor: limit 0x17 (three descriptors minus one), base = GDT
+    a.mov_moffs_imm16(PSEUDO + 0, 0x0017);
+    a.mov_moffs_imm16(PSEUDO + 2, GDT & 0xFFFF);
+    a.mov_moffs_imm16(PSEUDO + 4, (DATA_SEG >> 12) & 0xFFFF);
+
+    a.lgdt_moffs(PSEUDO);
+    a.mov_eax_cr0();
+    a.or_eax_imm8(0x01);            // CR0.PE
+    a.mov_cr0_eax();
+    a.jmp_far_label("pm_ok", 0x0008);
+
+    // Reached only if the far jump and the segment load both worked.
+    a.label("pm_ok");
+    a.mov_eax_cr0();
+    a.and_eax_imm8(0xFE);           // clear CR0.PE
+    a.mov_cr0_eax();
+    a.jmpl("after_P");
+    a.label("after_P");
 
     // ---- M: conventional memory ----------------------------------------
     a.mov_ah(0x00);
@@ -422,6 +488,7 @@ function assemble(a)
     a.mov_r16(0, 0x2402);
     a.int(0x15);
     fail("jc", "A");
+
 
     // ---- C: video mode reports 80 columns --------------------------------
     // AH=0Fh returns the column count in AH and the mode number in AL, so
