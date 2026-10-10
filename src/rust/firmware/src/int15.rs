@@ -39,9 +39,17 @@ fn e820_memory_map<M: Machine>(fw: &mut Firmware<M>) -> bool {
     // Each SMAP entry is a 24-byte descriptor: 8 base, 8 length, 4 type,
     // 4 ACPI extended attributes.
     if ebx as usize >= fw.e820.len() {
-        // No more entries.
+        // No more entries. The spec terminates the map with a call that
+        // fails: carry set and AH = 04h ("function not supported"), with
+        // EBX left alone.
+        //
+        // Resetting EBX to 0 here instead -- the convention some firmware
+        // uses, so a caller can test `while (ebx)` -- made the guard above
+        // unreachable, so this function could never report the end of the
+        // map at all, and a caller walking it by cursor got the first entry
+        // forever.
         fw.set_cf(true);
-        fw.set_ah(0x86); // function not supported
+        fw.set_ah(0x04);
         return true;
     }
 
@@ -57,13 +65,7 @@ fn e820_memory_map<M: Machine>(fw: &mut Firmware<M>) -> bool {
     }
 
     // Update EBX to the next entry index.
-    let next = ebx + 1;
-    fw.machine.write_reg(crate::machine::Reg::Ebx, next);
-
-    // If this was the last entry, set EBX to 0 to signal completion.
-    if next as usize >= fw.e820.len() {
-        fw.machine.write_reg(crate::machine::Reg::Ebx, 0);
-    }
+    fw.machine.write_reg(crate::machine::Reg::Ebx, ebx + 1);
 
     fw.set_cf(false);
     fw.set_ah(0);

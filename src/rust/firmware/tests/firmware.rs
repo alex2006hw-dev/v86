@@ -677,6 +677,60 @@ fn test_eltorito_rejects_a_missing_boot_record() {
 }
 
 #[test]
+fn test_int15_e820_terminates_with_carry_set() {
+    // The map ends with a *failing* call, not with EBX reset to zero.
+    // Resetting it made the exhaustion guard unreachable, so a caller
+    // walking the map by cursor was handed the first entry forever.
+    let mut fw = make_firmware();
+
+    // The map is built by POST, which this harness does not run, so give it
+    // the shape a small machine would report.
+    fw.e820 = vec![
+        v86_firmware::dispatch::E820Entry { base: 0, length: 0x9_FC00, kind: 1 },
+        v86_firmware::dispatch::E820Entry {
+            base: 0x10_0000,
+            length: 0x7F_0000,
+            kind: 1,
+        },
+    ];
+
+    // Walk the whole map the way a loader does: EBX is the cursor and the
+    // loop stops when carry comes back set.
+    let mut bx = 0u32;
+    let mut entries = Vec::new();
+    loop
+    {
+        // INT 15h dispatches on AH, so the selector has to be in AX every
+        // time -- not just the first call.
+        fw.machine.write_reg(Reg::Eax, 0xE820);
+        fw.machine.write_reg(Reg::Ebx, bx);
+        dispatch_service(&mut fw, 0x15);
+
+        if fw.machine.read_flag(Flag::Cf)
+        {
+            assert_eq!(
+                fw.machine.read_reg8(Reg::Eax, true),
+                0x04,
+                "the terminating call reports AH=04h"
+            );
+            break;
+        }
+
+        entries.push(bx);
+        bx = fw.machine.read_reg(Reg::Ebx);
+        assert!(entries.len() < 32, "the map must terminate");
+    }
+
+    assert_eq!(entries.len(), 2, "both entries were returned, got {:?}", entries);
+    assert_eq!(
+        entries,
+        vec![0, 1],
+        "entries were returned in cursor order"
+    );
+    assert_eq!(bx, 2, "the cursor points past the last entry when the map ends");
+}
+
+#[test]
 fn test_eltorito_emulated_media_sectors() {
     assert_eq!(eltorito::emulated_media_sectors(MEDIA_1440K_FLOPPY), Some(2880));
     assert_eq!(eltorito::emulated_media_sectors(MEDIA_NO_EMULATION), None);
