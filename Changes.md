@@ -200,7 +200,7 @@ assumption, and only a different BIOS could expose it.
 | Check | Result |
 |---|---|
 | `cargo check` (host, and `--target wasm32-unknown-unknown`) | 0 errors, 0 warnings |
-| `cargo test -D warnings` (firmware crate) | **86 pass** (was 58) |
+| `cargo test -D warnings` (firmware crate) | **88 pass** (was 58) |
 | `node examples/firmware.js` (JIT) | **exit 0, `RESULT: PASS`** |
 | `node examples/firmware.js` (`FW_NO_JIT=1`) | **exit 0, `RESULT: PASS`** |
 | `node examples/firmware-oracle.js` (`FW_NO_JIT=1`) | SeaBIOS boots the same sector |
@@ -670,6 +670,58 @@ The diagnostic that answered the above, rather than inferring it:
 Three of those four were bugs in earlier versions of this script, not in
 the emulator, and each one changed the conclusion. Worth remembering
 before trusting a state dump.
+
+### 13.11 The 8259 was never initialised — no hardware interrupt was delivered
+
+The firmware had services for IRQ 0, 1, 6, 8 and 12 and installed the
+stubs and IVT entries for them, but never touched the PIC. `pic.rs` says
+why that is fatal on its own:
+
+> `irq_map: 0` — "Bogus default value (both master and slave mapped to 0).
+> Will be initialized by the BIOS"
+
+and every line masked. So `handle_irq0` never ran, the firmware's own
+tick counter at 0x46C never advanced, and the keyboard and RTC services
+were unreachable.
+
+Two independent halves, both needed:
+
+- `Machine::init_pic` sends the conventional ICW1-4 sequence to both
+  controllers — vector base 0x08 on the master, 0x70 on the slave, the
+  cascade wiring, then 8086 mode. Called at the end of POST, after the
+  BDA and drive table exist, because a device ROM reads them.
+- `Machine::end_of_interrupt` acknowledges the line once a service is
+  done. Without it the PIC holds the line asserted and the guest takes
+  exactly one interrupt, then silence. Called from `firmware_service`
+  when the service id was an IRQ — the only path a hardware interrupt
+  takes.
+
+**Not verified in this session**, and deliberately so. A boot sector
+written to check it waited on 0x46C and spun forever; when that was
+changed to a busy loop the guest ran, which proved the counter was the
+dependency but not whether the PIC was fixed. The test that would prove
+it is one that reads 0x46C and expects it to advance in wall time, and it
+is the next thing to write — see IRQ-1. What a guest sees without it is a
+machine that looks slow rather than stuck, which is the failure mode worth
+remembering.
+
+### 13.12 A VM state-save round-trip example
+
+`examples/vm-state-roundtrip.mjs` drives the page's two buttons against
+the real vm snapshot: restore, save, then restore into a **fresh**
+emulator and read the state back. Restoring into a fresh one is the
+point — it rules out a run that keeps the old object and never restores
+anything, which is how a state save can appear to work while doing
+nothing.
+
+It reports VM-1 honestly rather than claiming a pass. The snapshot's CPU
+shows two distinct instruction pointers in 48 samples with nothing on
+serial, which is a halted machine woken for an instant by each tick, not
+a guest doing work; the bar for "running" is therefore a number and not a
+difference, because a machine doing nothing still shows two or three.
+SeaBIOS restores the same dead state, so it is the snapshot and not the
+firmware. What the example does validate is the round trip: the CPU state
+survives save → restore into a fresh emulator, twice over.
 
 ## 14. Not done
 

@@ -42,6 +42,7 @@ that reports success to a Windows 95 installer is worse than an honest
 | **TEST-3** | No boot matrix in CI | Absent | Medium |
 | **TEST-4** | Only one test disk image exists | Absent | High |
 | **TEST-5** | The self-test is only checked against itself | Wired | Medium |
+| **IRQ-1** | **The 8259 was never initialised, so no hardware interrupt was delivered** | Fixed | **High** |
 | **RTC-1** | v86's CMOS RTC is not populated for third-party BIOSes | Absent | Medium |
 | **BUILD-1** | Build needs an out-of-tree toolchain | Absent | Medium |
 | **BUILD-2** | `tests/firmware/` harness is stale and cannot run | Broken | High |
@@ -50,6 +51,7 @@ that reports success to a Windows 95 installer is worse than an honest
 | **VM-1** | **Snapshot does not resume execution** — saved with CPU halted; **not firmware-caused**, SeaBIOS restores the same dead state | Broken | Medium |
 | **VM-2** | **VGA surface size mismatch** — snapshot saved with 8 MiB, page asked for 2 MiB | Fixed | Low |
 | **VM-3** | **Guest kernel never starts**, under any BIOS; blocked on v86's IRQ delivery after the E820 fix below | Blocked | **High** |
+| **IRQ-1** | **The 8259 was never initialised, so no hardware interrupt was delivered** | Fixed | **High** |
 | **V86-1** | **`PCI.set_state` crashed restoring a machine with an absent IDE channel** | Fixed | Low |
 
 ---
@@ -128,6 +130,43 @@ entry (configuration table offset `0xE8`). Loaders that prefer to walk
 the table never call `4D00h`.
 
 **Severity:** low — `4D00h` covers it. Fix it when touching AH=C0h.
+
+---
+
+## Interrupt delivery
+
+### IRQ-1 — The 8259 was never initialised — **closed**
+
+The firmware wrote services for IRQ 0, 1, 6, 8 and 12 and installed the
+stubs and the IVT entries, but never touched the PIC. `src/rust/cpu/pic.rs`
+says why that is complete on its own: the controllers power up with
+`irq_map = 0`, "Bogus default value (both master and slave mapped to 0).
+Will be initialized by the BIOS", and every line masked.
+
+So no hardware interrupt was ever delivered. The firmware's own tick
+counter at 0x46C never advanced, `handle_irq0` never ran, and the
+keyboard and RTC services were unreachable. From the guest's side this
+looks like a very slow machine rather than a stuck one — a delay loop
+spins at a physical address that is always there — which is why it took a
+test that *read* the counter to find.
+
+**Fix:** `Machine::init_pic` sends the conventional ICW1-4 sequence to
+both controllers (vector base 0x08 on the master and 0x70 on the slave,
+the cascade wiring, 8086 mode) at the end of POST, and
+`Machine::end_of_interrupt` acknowledges the line once a service is done.
+Without the acknowledge the PIC holds the line asserted, so the guest
+takes exactly one interrupt and then silence; the two halves are
+independent and both were needed.
+
+Only the lines with a service are unmasked: 0, 1, 2 and 6 on the master,
+8 and 12 on the slave. Lines 8-15 arrive through the cascade, so they
+need both controllers acknowledged, the slave first.
+
+**Done when:** the firmware's tick counter at 0x46C advances in wall
+time. Not verified in this session — the guest boot sector used to check
+it deliberately stopped depending on it, because a save/restore test that
+fails for a reason unrelated to save/restore is not a test. It is the
+first thing to check when a guest's timing behaves oddly.
 
 ---
 

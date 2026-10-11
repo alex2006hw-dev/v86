@@ -186,6 +186,18 @@ The far call needs `Machine::push_u16`, which did not exist: it is the
 counterpart to `pop_stack_u16`, and the firmware's only reason to build
 a stack frame itself.
 
+### Hardware interrupts
+
+The firmware's IRQ 0/1/6/8/12 services were unreachable before the 8259
+was initialised. `Machine::init_pic` sends the ICW1-4 sequence to both
+controllers — vector base 0x08 on the master, 0x70 on the slave, the
+cascade wiring, 8086 mode — at the end of POST. `Machine::end_of_interrupt`
+acknowledges the line once a service is done; without it the PIC holds the
+line asserted and the guest takes one interrupt and then silence.
+
+Only the lines with a service are unmasked. Lines 8-15 arrive through the
+cascade, so they need both controllers acknowledged, the slave first.
+
 ---
 
 ## 6. Drives: registered by reference
@@ -272,7 +284,7 @@ The firmware has three layers of test:
 
 | Layer | How | What it catches |
 |---|---|---|
-| **Unit** | `cargo test -D warnings` (firmware crate) | Pure logic: dispatch, El Torito parsing, E820, VBE, option ROMs. 86 tests. |
+| **Unit** | `cargo test -D warnings` (firmware crate) | Pure logic: dispatch, El Torito parsing, E820, VBE, option ROMs. 88 tests. |
 | **Integration** | `node examples/firmware.js` | A hand-assembled boot sector that exercises the services a real loader depends on. Prints `RESULT: PASS`. |
 | **Browser** | `examples/firmware.html` | The same boot in a browser, with the VGA screen rendered. A dropdown also boots the same sector against SeaBIOS and the Bochs BIOS from `bios/`, so a difference between the rows is a firmware difference. `node examples/firmware-browser-check.mjs` checks the page's wiring headlessly. |
 | **State** | `examples/vm-state-check.mjs` | A change to guest state must survive `save_state` → `restore_state` into a fresh emulator, JIT on and off. |

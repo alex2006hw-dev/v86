@@ -277,7 +277,7 @@ See [tests/Readme.md](tests/Readme.md) for more information.
 The firmware has its own tests, none of which need a disk image:
 
 ```console
-$ make firmware-unit-test      # 86 host-side tests, no wasm toolchain needed
+$ make firmware-unit-test      # 88 host-side tests, no wasm toolchain needed
 $ node examples/firmware.js    # end-to-end boot test; exit 0 on success
 ```
 
@@ -338,6 +338,7 @@ BIOS from `bios/`.
 | [`cd-boot.js`](examples/cd-boot.js) | Boots a disk or CD image, reporting which structures it found first so a failure says which path was expected. |
 | [`vm-coldboot.mjs`](examples/vm-coldboot.mjs) | Cold-boots the `vm/` guest from its bzimage, and reports how far the kernel got. Needs `vm/` served over HTTP. |
 | [`vm-state-check.mjs`](examples/vm-state-check.mjs) | Validates that a change to VM state survives `save_state` → `restore_state`, with the JIT on and off. |
+| [`vm-state-roundtrip.mjs`](examples/vm-state-roundtrip.mjs) | Drives the page's Save/Restore buttons against the real `vm/` snapshot, restoring into a fresh emulator so the restore cannot be a no-op. Reports VM-1 honestly. Needs `vm/` served over HTTP. |
 | [`build-test-iso.mjs`](examples/build-test-iso.mjs) | Builds a 21-sector El Torito ISO around the self-test boot sector, giving the CD path a controlled subject. |
 | [`firmware.html`](examples/firmware.html) | The same thing in a browser: boots the self-test on the built-in firmware, and can boot the same sector against SeaBIOS and the Bochs BIOS for comparison. Serve `examples/` over HTTP and open it. |
 | [`firmware-browser-check.mjs`](examples/firmware-browser-check.mjs) | Checks the page's wiring and its boot configuration without a browser. `node examples/firmware-browser-check.mjs` |
