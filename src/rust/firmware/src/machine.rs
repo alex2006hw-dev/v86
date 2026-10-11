@@ -189,6 +189,35 @@ pub trait Machine {
     /// flag in CMOS status register C.
     fn acknowledge_rtc(&mut self) {}
 
+    /// Initialise the 8259 pair and unmask the firmware's IRQ lines.
+    ///
+    /// What a real BIOS does during POST. The 8259 powers up with
+    /// `irq_map = 0` -- "Bogus default value (both master and slave
+    /// mapped to 0). Will be initialized by the BIOS" -- and every line
+    /// masked, so without the ICW sequence no interrupt reaches the guest
+    /// at all and the firmware's own tick counter at 0x46C never
+    /// advances. That shows up as a guest spinning on a delay loop
+    /// forever, because the counter it waits on is written by the IRQ 0
+    /// service, which is never called.
+    ///
+    /// The sequence is the conventional one: ICW1 with ICW4 expected,
+    /// then the vector base, then the cascade wiring, then 8086 mode.
+    /// ICW4 without bit 0 set leaves the PIC asking for an EOI, which is
+    /// what the non-specific EOI afterwards provides.
+    ///
+    /// Hosts with no PIC leave the default, which changes nothing.
+    fn init_pic(&mut self) {}
+
+    /// Acknowledge a hardware interrupt at the PIC so the next one fires.
+    ///
+    /// Without this the first interrupt the guest takes is also the last:
+    /// the PIC holds the line asserted until it is told the service is
+    /// done, so a guest gets one timer tick and then silence.
+    ///
+    /// `irq` is the hardware line. Lines 8-15 arrive through the cascade,
+    /// so they need both PICs acknowledged.
+    fn end_of_interrupt(&mut self, _irq: u8) {}
+
     /// Perform a far call to `segment:offset`, as an interrupt service
     /// chaining to the next handler in a chain does. The default
     /// implementation is a no-op so hosts that do not chain need do

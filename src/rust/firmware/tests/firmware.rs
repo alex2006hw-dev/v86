@@ -34,6 +34,10 @@ struct TestMachine {
     rtc: RtcReading,
     /// Far calls services asked for instead of performing them.
     chains: Vec<(u16, u16)>,
+    /// Hardware interrupt lines the firmware acknowledged at the PIC.
+    acknowledged: Vec<u8>,
+    /// How many times it acknowledged one.
+    eoi_count: usize,
 }
 
 impl TestMachine {
@@ -48,6 +52,8 @@ impl TestMachine {
             frame_ip: None,
             key_queue: Vec::new(),
             chains: Vec::new(),
+            acknowledged: Vec::new(),
+            eoi_count: 0,
             rtc: RtcReading {
                 year: 2026,
                 month: 10,
@@ -151,6 +157,14 @@ impl Machine for TestMachine {
     /// an interrupt chained.
     fn chain_to(&mut self, segment: u16, offset: u16) {
         self.chains.push((segment, offset));
+    }
+
+    /// Record the PIC acknowledgement, so a test can assert the
+    /// interrupt was told about -- without which the guest gets one tick
+    /// and no more.
+    fn end_of_interrupt(&mut self, irq: u8) {
+        self.acknowledged.push(irq);
+        self.eoi_count += 1;
     }
 }
 
@@ -1027,6 +1041,29 @@ fn int15_extended_memory_reports_installed_not_conventional() {
     assert_eq!(fw.machine.read_reg(Reg::Ecx) & 0xFFFF, 15 * 1024, "CX");
     assert_eq!(fw.machine.read_reg(Reg::Edx) & 0xFFFF,
         ((64 * 1024 - 1024 - 15 * 1024) / 64) as u32, "DX");
+}
+
+#[test]
+fn hardware_interrupts_are_acknowledged_at_the_pic() {
+    // The 8259 holds a line asserted until it is told the service is done,
+    // so a guest gets exactly one tick if the IRQ is never acknowledged.
+    // `firmware_service` is what the ROM stub reaches, so this has to go
+    // through it rather than straight to the handler.
+    let mut fw = make_firmware();
+
+    // A guest stack shaped the way a stub leaves it: the service id on
+    // top, then the return frame.
+    fw.machine.stack.clear();
+    fw.machine.stack.push(0x08);   // service id: IRQ 0 / INT 08h
+
+    let handled = v86_firmware::firmware_service(&mut fw);
+
+    assert!(handled, "IRQ 0 should be a service");
+    assert_eq!(fw.machine.acknowledged, vec![0], "the master PIC was not acknowledged");
+    assert_eq!(
+        fw.machine.eoi_count, 1,
+        "the interrupt was never acknowledged, so no second tick could be delivered"
+    );
 }
 
 // ------------------------------------------------------------------

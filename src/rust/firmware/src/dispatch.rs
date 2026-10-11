@@ -371,7 +371,34 @@ pub fn firmware_service<M: Machine>(fw: &mut Firmware<M>) -> bool {
     // pushed, which predates whatever the service just did. Copy carry
     // across, or every status-returning service reports success.
     fw.machine.patch_saved_flags();
+
+    // A hardware interrupt has to be acknowledged before the service
+    // returns, or the PIC keeps the line asserted and the next one never
+    // arrives. A guest that relies on the timer would then take exactly
+    // one tick, which is the hardest kind of bug to see from the guest's
+    // side: it looks like a very slow machine rather than a stuck one.
+    if let Some(irq) = irq_for(service)
+    {
+        fw.machine.end_of_interrupt(irq);
+    }
+
     handled
+}
+
+/// The hardware interrupt line a service id belongs to, if any.
+///
+/// These are the same ids the ROM stubs push for their vectors, so the
+/// mapping is the vector-to-IRQ one the IBM/AT defines: vector 08h is IRQ
+/// 0, and 70h/74h are the slave's 8 and 12.
+fn irq_for(service: u16) -> Option<u8> {
+    match service {
+        0x08 => Some(0),
+        0x09 => Some(1),
+        0x0E => Some(6),
+        0x70 => Some(8),
+        0x74 => Some(12),
+        _ => None,
+    }
 }
 
 /// Run one service by id. Split out from [`firmware_service`] so tests
@@ -387,8 +414,7 @@ pub fn dispatch_service<M: Machine>(fw: &mut Firmware<M>, service: u16) -> bool 
         0x0E => crate::irq::handle_irq6(fw),
         0x70 => crate::irq::handle_irq8(fw),
         0x74 => crate::irq::handle_irq12(fw),
-        0x10 => crate::int10::handle_int10(fw),
-        0x11 => handle_int11(fw),
+        0x10 => crate::int10::handle_int10(fw),        0x11 => handle_int11(fw),
         0x12 => handle_int12(fw),
         0x13 => {
             crate::int13::handle_int13(fw);

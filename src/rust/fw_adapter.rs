@@ -710,6 +710,42 @@ impl Machine for EmulatorMachine {
         }
     }
 
+    fn init_pic(&mut self) {
+        use crate::cpu::pic::{port20_write, port21_write, portA0_write, portA1_write};
+
+        // Master. ICW1 says "cascaded, expect ICW4"; ICW2 puts the vector
+        // base at 0x08, where the AT's IRQ 0 lives.
+        port20_write(0x11);
+        port21_write(0x08);
+        port21_write(0x04);   // ICW3: the slave is on master's IRQ 2
+        port21_write(0x01);   // ICW4: 8086 mode, normal EOI, non-buffered
+
+        // Slave, with its own vector base at 0x70 where IRQ 8 lives.
+        portA0_write(0x11);
+        portA1_write(0x70);
+        portA1_write(0x02);   // ICW3: this controller is cascade input 2
+        portA1_write(0x01);
+
+        // The 8259 masks by *setting* a bit, so the value written is the
+        // complement of the lines being turned on. The master gets the
+        // timer, the keyboard, the floppy and the cascade the slave hangs
+        // off; the slave gets the RTC and the PS/2 mouse. Those are the
+        // lines `dispatch_service` has a service for.
+        const MASTER: u8 = !(1 << 0 | 1 << 1 | 1 << 2 | 1 << 6);
+        const SLAVE: u8 = !(1 << 0 | 1 << 4);
+
+        port21_write(MASTER);
+        portA1_write(SLAVE);
+    }
+    fn end_of_interrupt(&mut self, irq: u8) {
+        // Lines 8-15 arrive through the cascade, so both controllers are
+        // told -- the slave first, then the master.
+        if irq >= 8 {
+            crate::cpu::pic::portA0_write(0x20);
+        }
+        crate::cpu::pic::port20_write(0x20);
+    }
+
     fn patch_saved_flags(&mut self) {
         unsafe {
             // The trap fires *before* the `int` pushes anything: the CPU has

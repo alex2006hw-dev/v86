@@ -140,7 +140,15 @@ pub fn run_post<M: Machine>(fw: &mut Firmware<M>) {
     //    jump) means the rest of this function never runs.
     crate::option_rom::run_all(fw);
 
-    // 8. Mark POST complete.
+    // 8. Leave the PIC delivering the interrupts the firmware services.
+    //    It powers up with a bogus vector map ("will be initialized by
+    //    the BIOS") and every line masked, so without the ICW sequence no
+    //    interrupt reaches the guest at all, the firmware's tick counter
+    //    at 0x46C never advances, and a guest waiting on it waits
+    //    forever.
+    fw.machine.init_pic();
+
+    // 9. Mark POST complete.
     fw.pending_boot = true;
     fw.trace(tag::POST, "POST complete");
 }
