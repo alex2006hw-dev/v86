@@ -1788,6 +1788,13 @@ CPU.prototype.load_firmware = function(settings, boot_drives)
 
     var ok = this.firmware_init(
         memory_kib,
+        // The same figure for E820, unclamped: the BDA word is 16 bits
+        // and INT 12h never meant "all the RAM", but E820 and the
+        // INT 15h extended-memory services do. Passing the clamped value
+        // here tells a guest it has half the machine, and a kernel that
+        // sizes its page tables from E820 then puts them where the
+        // emulator has no memory at all.
+        Math.min(settings.memory_size >> 10, 0xFFFFFFF),
         Math.min(floppy_count, 2),
         1,   // serial ports
         1,   // parallel ports

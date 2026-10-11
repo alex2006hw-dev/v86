@@ -194,6 +194,7 @@ pub fn push_key(scancode: u8, pressed: bool) {
 #[no_mangle]
 pub extern "C" fn v86_firmware_init(
     memory_kib: u32,
+    total_memory_kib: u32,
     floppy_count: u32,
     serial_count: u32,
     printer_count: u32,
@@ -218,6 +219,10 @@ pub extern "C" fn v86_firmware_init(
 
     init_firmware(Config {
         memory_kib: memory_kib.min(u16::MAX as u32) as u16,
+        // The total is what the emulator's RAM actually is. It is passed
+        // separately because the BDA word is 16 bits and means
+        // conventional memory, which is not the same thing.
+        total_memory_kib: total_memory_kib.max(u32::from(memory_kib.min(u16::MAX as u32))),
         boot_order: order,
         floppy_count: floppy_count.min(2) as u8,
         serial_count: serial_count.min(4) as u8,

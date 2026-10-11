@@ -168,12 +168,19 @@ pub extern "C" fn fw_destroy(f: *mut FirmwareBox) {
 }
 
 /// Set the configured memory size in KiB (drives E820 / INT 12h).
+///
+/// Sets both figures: the 16-bit BDA word cannot hold more than 64 MiB,
+/// and the BIOS has never reported the machine's total there.
 #[no_mangle]
 pub extern "C" fn fw_set_memory_kib(f: *mut FirmwareBox, kib: u32) {
     if f.is_null() {
         return;
     }
-    unsafe { &mut *f }.inner_mut().config.memory_kib = kib as u16;
+    unsafe {
+        let config = &mut (&mut *f).inner_mut().config;
+        config.memory_kib = kib.min(u16::MAX as u32) as u16;
+        config.total_memory_kib = kib.max(u32::from(config.memory_kib));
+    }
 }
 
 /// Write the system BIOS and video option ROM into guest memory and

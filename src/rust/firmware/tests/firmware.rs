@@ -987,6 +987,48 @@ fn an_option_rom_that_does_not_fit_stops_the_run_rather_than_overflowing() {
 }
 
 
+#[test]
+fn e820_covers_all_installed_memory() {
+    // A guest reads E820 to decide where its page tables may go, so a map
+    // that stops short of the machine is a bug rather than a limit. This
+    // is exactly what the bzImage cold boot hit: the map was built from
+    // the 16-bit conventional figure and ended at 64 MiB on a 128 MiB
+    // machine, so the kernel placed page tables where the emulator has
+    // no memory.
+    let mut fw = make_firmware();
+    fw.config.memory_kib = 640;
+    fw.config.total_memory_kib = 128 * 1024;
+    v86_firmware::post::install_roms(&mut fw);
+    v86_firmware::post::run_post(&mut fw);
+
+    let last = fw.e820.last().expect("the map is not empty");
+    assert_eq!(last.kind, 1, "the final entry is usable memory");
+    assert_eq!(
+        last.base + last.length,
+        128 * 1024 * 1024,
+        "E820 must describe all installed memory, not the conventional figure"
+    );
+}
+
+#[test]
+fn int15_extended_memory_reports_installed_not_conventional() {
+    let mut fw = make_firmware();
+    fw.config.memory_kib = 640;
+    fw.config.total_memory_kib = 64 * 1024;
+
+    // AH=88h: extended memory above 1 MiB, so 64 MiB less the first MiB.
+    fw.machine.write_reg(Reg::Eax, 0x88_00);
+    assert!(dispatch_service(&mut fw, 0x15));
+    assert_eq!(fw.machine.read_reg(Reg::Eax) & 0xFFFF, (64 * 1024 - 1024) as u32, "AX");
+
+    // AX=E801h: CX counts 1-16 MiB and DX the 64 KiB blocks above it.
+    fw.machine.write_reg(Reg::Eax, 0xE801);
+    assert!(dispatch_service(&mut fw, 0x15));
+    assert_eq!(fw.machine.read_reg(Reg::Ecx) & 0xFFFF, 15 * 1024, "CX");
+    assert_eq!(fw.machine.read_reg(Reg::Edx) & 0xFFFF,
+        ((64 * 1024 - 1024 - 15 * 1024) / 64) as u32, "DX");
+}
+
 // ------------------------------------------------------------------
 // VBE tests
 // ------------------------------------------------------------------

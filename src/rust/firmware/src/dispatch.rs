@@ -22,8 +22,15 @@ pub struct Config {
     /// Conventional memory size in KiB (written to BDA 0x413).
     ///
     /// This is the low, below-1 MiB memory a PC BIOS reports, not the
-    /// total installed.
+    /// total installed. [`Config::total_memory_kib`] is that, and the two
+    /// have to stay separate: the BDA word is 16 bits and INT 12h has
+    /// never meant "all the RAM".
     pub memory_kib: u16,
+    /// Total installed memory in KiB, used for the E820 map and the
+    /// INT 15h AH=88h/E801h extended-memory services. A QEMU guest with
+    /// 128 MiB reports 128 MiB here, which is what a kernel sizing its
+    /// page tables reads.
+    pub total_memory_kib: u32,
     /// Boot order: "floppy", "hd", "cd" in priority order.
     pub boot_order: Vec<&'static str>,
     /// Number of floppy drives.
@@ -50,6 +57,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             memory_kib: 640,
+            total_memory_kib: 1024 * 1024,
             boot_order: vec!["floppy", "hd", "cd"],
             floppy_count: 1,
             serial_count: 1,

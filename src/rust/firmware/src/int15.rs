@@ -74,14 +74,12 @@ fn e820_memory_map<M: Machine>(fw: &mut Firmware<M>) -> bool {
 
 /// AX=E801h: get extended memory size (up to 4 GB).
 fn e801_memory_size<M: Machine>(fw: &mut Firmware<M>) -> bool {
-    let mem_kib = fw.config.memory_kib as u32;
-    let extended_kib = if mem_kib > 640 {
-        // Extended memory above 1 MB, in 16 KB granularity.
-        let extended_bytes = (mem_kib as u64 - 640 * 1024) * 1024;
-        ((extended_bytes + 16383) / 16384) as u32
-    } else {
-        0
-    };
+    // 1 MiB, in KiB, is where extended memory begins -- the conventional
+    // 640 KiB is a subset of it, not the boundary.
+    const ONE_MIB_KIB: u32 = 1024;
+    let total_kib = fw.config.total_memory_kib;
+
+    let extended_kib = total_kib.saturating_sub(ONE_MIB_KIB);
     // CX = extended memory between 1 MB and 16 MB (in KB).
     let cx = extended_kib.min(15 * 1024);
     // DX = extended memory above 16 MB (in 64 KB blocks).
@@ -100,12 +98,8 @@ fn e801_memory_size<M: Machine>(fw: &mut Firmware<M>) -> bool {
 
 /// AH=88h: get extended memory size (legacy, up to 64 MB).
 fn extended_memory_size<M: Machine>(fw: &mut Firmware<M>) -> bool {
-    let mem_kib = fw.config.memory_kib as u32;
-    let extended_kib = if mem_kib > 640 {
-        mem_kib - 640
-    } else {
-        0
-    };
+    let total_kib = fw.config.total_memory_kib;
+    let extended_kib = total_kib.saturating_sub(1024);
     // Legacy function returns up to 64 MB (65535 KB).
     fw.set_ax(extended_kib.min(65535) as u16);
     fw.set_cf(false);

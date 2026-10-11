@@ -277,8 +277,11 @@ fn init_bda<M: Machine>(fw: &mut Firmware<M>) {
 
 /// Build the E820 memory map.
 fn build_e820<M: Machine>(fw: &mut Firmware<M>) {
-    let mem_kib = fw.config.memory_kib as u64;
-    let total_bytes = (mem_kib as u64) * 1024;
+    // The map describes *installed* memory, so the total and not the
+    // conventional figure: a kernel reads this to decide where it may put
+    // page tables, and a map that stops short of the machine it is on
+    // makes it place them where the emulator has none.
+    let total_bytes = u64::from(fw.config.total_memory_kib) * 1024;
 
     fw.e820.clear();
 
