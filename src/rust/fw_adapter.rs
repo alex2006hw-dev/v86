@@ -349,6 +349,40 @@ pub extern "C" fn v86_firmware_add_drive(image: u32, kind: u32, total_sectors: u
     }
 }
 
+/// Register an option ROM image and return 0, or -1 if it could not be
+/// read.
+///
+/// `image` is a handle into the host's `firmware_images` and `len` is the
+/// length in bytes, exactly as [`v86_firmware_add_drive`] numbers its
+/// images. The ROM is copied in rather than held by reference, because
+/// POST has to place it in guest memory at an address the guest can
+/// read, and the guest may read it back.
+///
+/// There is no limit on size beyond what a wasm allocation can do, but
+/// the option-ROM run is `0xD0000`-`0xE0000`, so anything past 64 KiB
+/// cannot be placed and is rejected here rather than half-run.
+#[no_mangle]
+pub extern "C" fn v86_firmware_add_option_rom(image: u32, len: u32) -> i32 {
+    const MAX_ROM: usize = 64 * 1024;
+
+    unsafe {
+        let fw = firmware_ptr();
+        if fw.is_null() || len == 0 || len as usize > MAX_ROM {
+            return -1;
+        }
+
+        let mut data = vec![0u8; len as usize];
+        let machine: *mut EmulatorMachine = &mut (*fw).machine;
+
+        if !(*machine).read_host_image(image as u8, 0, &mut data) {
+            return -1;
+        }
+
+        (*fw).option_roms.push(data);
+        0
+    }
+}
+
 /// Address of a drive's image buffer, or null. The host may read and
 /// write it directly, which keeps image loading a single memory copy.
 #[no_mangle]
@@ -706,6 +740,15 @@ impl Machine for EmulatorMachine {
             let word = memory::read16(stack_phys());
             adjust_stack_reg(2);
             word as u16
+        }
+    }
+
+    fn push_u16(&mut self, value: u16) {
+        unsafe {
+            // SP is decremented first so the write lands at the new top,
+            // which is the same frame layout `pop_stack_u16` reverses.
+            adjust_stack_reg(-2);
+            memory::write16(stack_phys(), i32::from(value));
         }
     }
 

@@ -121,6 +121,10 @@ impl Machine for TestMachine {
         self.stack.pop().unwrap_or(0)
     }
 
+    fn push_u16(&mut self, value: u16) {
+        self.stack.push(value);
+    }
+
     fn peek_service_id(&self) -> u32 {
         self.stack.last().copied().unwrap_or(0xFFFF) as u32
     }
@@ -807,6 +811,181 @@ fn test_reset_vector_is_reachable_in_the_system_rom() {
     let reset = v86_firmware::rom::SYSTEM_ROM_BASE + 0xFFF0;
     assert_eq!(fw.machine.read_u8(reset), 0xE9, "reset vector jumps to POST");
 }
+
+// ------------------------------------------------------------------
+// Option ROM tests
+// ------------------------------------------------------------------
+
+/// A valid 512-byte option ROM image, as the host would build one.
+fn make_option_rom(entry: &[u8]) -> Vec<u8> {
+    let mut data = vec![0u8; 512];
+    data[0] = 0x55;
+    data[1] = 0xAA;
+    data[2] = 1;
+    for (i, b) in entry.iter().enumerate() {
+        data[3 + i] = *b;
+    }
+    let sum: u32 = data.iter().map(|&b| u32::from(b)).sum();
+    data[511] = (-(sum as i32) & 0xFF) as u8;
+    data
+}
+
+#[test]
+fn option_roms_are_registered_and_left_for_a_second_post() {
+    let mut fw = make_firmware();
+    fw.option_roms.push(make_option_rom(&[0xCB])); // retf
+    assert_eq!(fw.option_roms.len(), 1);
+}
+
+#[test]
+fn a_registered_option_rom_is_placed_where_a_guest_can_read_it() {
+    let mut fw = make_firmware();
+    let rom = make_option_rom(&[0xCB]); // retf
+    fw.option_roms.push(rom.clone());
+    v86_firmware::post::install_roms(&mut fw);
+    v86_firmware::option_rom::run_all(&mut fw);
+
+    // It lands at the base of the run, byte for byte.
+    let base = v86_firmware::option_rom::OPTION_ROM_BASE;
+    for (i, b) in rom.iter().enumerate() {
+        assert_eq!(fw.machine.read_u8(base + i as u32), *b, "byte {} differs", i);
+    }
+}
+
+#[test]
+fn a_registered_option_rom_is_entered_with_a_far_call() {
+    let mut fw = make_firmware();
+    fw.option_roms.push(make_option_rom(&[0xCB])); // retf
+    v86_firmware::post::install_roms(&mut fw);
+    v86_firmware::option_rom::run_all(&mut fw);
+
+    // CS:IP names the entry at offset 3 of the placed image.
+    let base = v86_firmware::option_rom::OPTION_ROM_BASE;
+    let segment = (base >> 4) as u16;
+    assert_eq!(fw.machine.read_seg(SegReg::Cs), segment);
+    assert_eq!(fw.machine.read_ip(), 3);
+
+    // The stack holds the far-return frame: offset pushed first, then the
+    // segment, so a `retf` finds CS at [SP] and IP at [SP+2].
+    let stack = &fw.machine.stack;
+    let top = stack.len();
+    assert_eq!(stack[top - 1], v86_firmware::rom::SYSTEM_ROM_SEG);
+    let return_offset = stack[top - 2] as u32;
+    assert!(return_offset > 0, "no return address was pushed");
+}
+
+#[test]
+fn an_option_rom_return_lands_next_to_the_int_19h_stub() {
+    let mut fw = make_firmware();
+    fw.option_roms.push(make_option_rom(&[0xCB]));
+    v86_firmware::post::install_roms(&mut fw);
+    v86_firmware::option_rom::run_all(&mut fw);
+
+    // Whatever the ROM returns to has to be code in the system ROM, and
+    // it has to reach the bootstrap rather than fall into the filler.
+    // A far call pushes the offset first and the segment second, so the
+    // offset is the second word from the top.
+    let top = fw.machine.stack.len();
+    let return_offset = fw.machine.stack[top - 2] as u32;
+    let stub = fw.roms.as_ref().unwrap().stub(0x19).unwrap() as u32;
+    assert!(v86_firmware::rom::is_firmware_rom(
+        v86_firmware::rom::SYSTEM_ROM_BASE + return_offset
+    ));
+    // The first byte is the far jump, and its target is the INT 19h stub.
+    let at = v86_firmware::rom::SYSTEM_ROM_BASE + return_offset;
+    assert_eq!(fw.machine.read_u8(at), 0xEA, "the return path is a far jump");
+    let target = fw.machine.read_u16(at + 1) as u32;
+    assert_eq!(target, stub, "the return path jumps to the INT 19h stub");
+}
+
+#[test]
+fn an_invalid_option_rom_is_not_entered_but_does_not_stall_the_rest() {
+    let mut fw = make_firmware();
+    // A corrupt image: broken checksum.
+    let mut bad = make_option_rom(&[0xCB]);
+    bad[0x40] ^= 0xFF;
+    fw.option_roms.push(bad);
+    // A good one behind it.
+    fw.option_roms.push(make_option_rom(&[0xCB]));
+    v86_firmware::post::install_roms(&mut fw);
+    v86_firmware::option_rom::run_all(&mut fw);
+
+    // The good ROM is at the *second* slot, because rejection skips past
+    // what the bad image claimed.
+    let second = v86_firmware::option_rom::OPTION_ROM_BASE + 512;
+    assert_eq!(fw.machine.read_seg(SegReg::Cs), (second >> 4) as u16);
+    assert_eq!(fw.machine.read_ip(), 3);
+    // And the good ROM's own bytes are there, not the rejected one's.
+    assert_eq!(fw.machine.read_u8(second), 0x55);
+    assert_eq!(fw.machine.read_u8(second + 1), 0xAA);
+}
+
+#[test]
+fn post_runs_option_roms_before_the_bootstrap() {
+    let mut fw = make_firmware();
+    fw.option_roms.push(make_option_rom(&[0xCB]));
+    v86_firmware::post::install_roms(&mut fw);
+    v86_firmware::post::run_post(&mut fw);
+
+    // run_post ends by handing over to a registered ROM, so the CPU is
+    // left in it and the normal bootstrap never runs.
+    let base = v86_firmware::option_rom::OPTION_ROM_BASE;
+    assert_eq!(fw.machine.read_seg(SegReg::Cs), (base >> 4) as u16,
+        "POST should have entered the option ROM");
+    assert!(fw.pending_boot, "POST should still report completion");
+}
+
+#[test]
+fn a_second_option_rom_is_placed_after_the_first() {
+    let mut fw = make_firmware();
+    let first = make_option_rom(&[0xCB]);
+    let second = make_option_rom(&[0xCB]);
+    fw.option_roms.push(first.clone());
+    fw.option_roms.push(second.clone());
+    v86_firmware::post::install_roms(&mut fw);
+    v86_firmware::option_rom::run_all(&mut fw);
+
+    // Only the first is entered -- the second is placed for a guest that
+    // scans, which is what a real BIOS does too.
+    let base = v86_firmware::option_rom::OPTION_ROM_BASE;
+    for (i, b) in first.iter().enumerate() {
+        assert_eq!(fw.machine.read_u8(base + i as u32), *b);
+    }
+    for (i, b) in second.iter().enumerate() {
+        assert_eq!(fw.machine.read_u8(base + 512 + i as u32), *b, "byte {} of the second", i);
+    }
+    // Both ROMs are run, in registration order, so the CPU is left in the
+    // second one.
+    assert_eq!(fw.machine.read_seg(SegReg::Cs), ((base + 512) >> 4) as u16);
+    assert_eq!(fw.machine.read_ip(), 3);
+}
+
+#[test]
+fn an_option_rom_that_does_not_fit_stops_the_run_rather_than_overflowing() {
+    let mut fw = make_firmware();
+    // 64 KiB of valid image would consume the whole run, so there is
+    // nowhere for a second one.
+    let mut big = make_option_rom(&[0xCB]);
+    big.resize(64 * 1024, 0);
+    big[2] = 128; // 128 blocks = 64 KiB
+    // The checksum byte has to be zero while the sum is taken, or the
+    // value it replaces is still counted.
+    big[511] = 0;
+    let sum: u32 = big.iter().map(|&b| u32::from(b)).sum();
+    big[511] = (-(sum as i32) & 0xFF) as u8;
+    assert_eq!(v86_firmware::option_rom::validate(&big), Ok(64 * 1024));
+    fw.option_roms.push(big);
+    fw.option_roms.push(make_option_rom(&[0xCB]));
+    v86_firmware::post::install_roms(&mut fw);
+    v86_firmware::option_rom::run_all(&mut fw);
+
+    // The first filled the run, so the second was not placed: reading
+    // past the run is out of bounds and would panic if it had tried.
+    let base = v86_firmware::option_rom::OPTION_ROM_BASE;
+    assert_eq!(fw.machine.read_seg(SegReg::Cs), (base >> 4) as u16);
+    assert_eq!(fw.machine.read_ip(), 3);
+}
+
 
 // ------------------------------------------------------------------
 // VBE tests

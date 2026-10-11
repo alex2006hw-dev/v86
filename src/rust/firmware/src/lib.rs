@@ -34,6 +34,7 @@ pub mod int1a;
 pub mod irq;
 pub mod ivt;
 pub mod machine;
+pub mod option_rom;
 pub mod post;
 pub mod rom;
 pub mod status;

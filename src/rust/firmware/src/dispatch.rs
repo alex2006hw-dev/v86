@@ -19,7 +19,10 @@ pub const VBE_ROM_BASE: u32 = 0xC8000;
 /// Firmware configuration, set by the host at init time.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Base memory size in KiB (written to BDA 0x413).
+    /// Conventional memory size in KiB (written to BDA 0x413).
+    ///
+    /// This is the low, below-1 MiB memory a PC BIOS reports, not the
+    /// total installed.
     pub memory_kib: u16,
     /// Boot order: "floppy", "hd", "cd" in priority order.
     pub boot_order: Vec<&'static str>,
@@ -162,6 +165,9 @@ pub struct Firmware<M: Machine> {
     pub roms: Option<crate::rom::SystemRomLayout>,
     /// Where the video option ROM's entry points live, once installed.
     pub vga_rom: Option<crate::rom::VgaRomLayout>,
+    /// Option ROMs the host registered, as raw images. Run during POST,
+    /// then placed back so a save/restore still has them.
+    pub option_roms: Vec<Vec<u8>>,
     /// Diagnostics: what the firmware did, for the host to read.
     pub trace: crate::debug::Trace,
 }
@@ -185,6 +191,7 @@ impl<M: Machine> Firmware<M> {
             video_chip: Box::new(crate::vbe::NullVideoHost),
             roms: None,
             vga_rom: None,
+            option_roms: Vec::new(),
             trace: crate::debug::Trace::new(),
         }
     }

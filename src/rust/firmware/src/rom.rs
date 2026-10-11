@@ -104,6 +104,9 @@ pub struct SystemRomLayout {
     /// Offset of the `push id; int TRAP_VECTOR; iret` stub for a vector,
     /// or `NONE` for a vector with no stub.
     pub stubs: [u16; 256],
+    /// Offset of the continuation an option ROM returns into, which
+    /// jumps to the bootstrap.
+    pub option_rom_return: u16,
 }
 
 /// Marks a vector that has no stub.
@@ -252,7 +255,20 @@ pub fn build_system_rom() -> SystemRom {
     a.emit(&[0xEA, 0x00, 0x00]);
     a.dw(SYSTEM_ROM_SEG);
 
-    let layout = SystemRomLayout { post: 0x0000, stubs };
+    // ---- the return an option ROM lands on ---------------------------
+    //
+    // A ROM is entered with a far call, so a ROM that returns resumes
+    // here. Everything POST has left to do is the bootstrap, and INT 19h
+    // never comes back either, so a far jump to its stub is the whole
+    // continuation. It has to be far, not near: a ROM may have left CS
+    // naming anything.
+    let option_rom_return = cursor as u16;
+    a.at(cursor);
+    a.emit(&[0xEA]); // jmp far segment:offset
+    a.dw(stubs[0x19]);
+    a.dw(SYSTEM_ROM_SEG);
+
+    let layout = SystemRomLayout { post: 0x0000, stubs, option_rom_return };
     SystemRom {
         image: a.finish(),
         layout,

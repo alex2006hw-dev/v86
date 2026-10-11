@@ -131,7 +131,16 @@ pub fn run_post<M: Machine>(fw: &mut Firmware<M>) {
         &format!("POST done: {} KiB, equipment {:#06X}", mem, equip),
     );
 
-    // 7. Mark POST complete.
+    // 7. Run any option ROM the host registered. This has to come after
+    //    the BDA and the drive table exist -- a ROM reads them -- and
+    //    before the bootstrap, because the whole point of most ROMs is
+    //    to be that bootstrap or to prepare it.
+    //
+    //    A ROM that does not return (the Linux boot stub ends in a far
+    //    jump) means the rest of this function never runs.
+    crate::option_rom::run_all(fw);
+
+    // 8. Mark POST complete.
     fw.pending_boot = true;
     fw.trace(tag::POST, "POST complete");
 }

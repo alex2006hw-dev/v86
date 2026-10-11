@@ -365,6 +365,7 @@ CPU.prototype.wasm_patch = function()
     this.firmware_init = this.wm.exports["v86_firmware_init"];
     this.firmware_add_floppy = this.wm.exports["v86_firmware_add_floppy"];
     this.firmware_add_drive = this.wm.exports["v86_firmware_add_drive"];
+    this.firmware_add_option_rom = this.wm.exports["v86_firmware_add_option_rom"];
     this.firmware_drive_ptr = this.wm.exports["v86_firmware_drive_ptr"];
     this.firmware_drive_len = this.wm.exports["v86_firmware_drive_len"];
     this.firmware_set_rtc = this.wm.exports["v86_firmware_set_rtc"];
@@ -1089,6 +1090,15 @@ CPU.prototype.init = function(settings, device_bus)
         {
             this.option_roms.push(option_rom);
         }
+    }
+
+    // Option ROMs have to be registered *after* the hosts that build
+    // them: `load_kernel` pushes its stub during the call above, and a
+    // `restore_state` rebuilds them too. Registering earlier would see an
+    // empty list and POST would run nothing.
+    if(firmware_loaded)
+    {
+        this.register_firmware_option_roms();
     }
 
     io.register_read(0xB3, this, function()
@@ -1833,6 +1843,47 @@ CPU.prototype.load_firmware = function(settings, boot_drives)
     }
 
     return true;
+};
+
+/**
+ * Register the option ROMs the host built with the firmware.
+ *
+ * v86's `bzimage` and `multiboot` boots both work by handing the firmware
+ * a stub to run during POST, which is what starts the kernel. Unlike a CD
+ * image these are small enough to copy in, and POST has to place them in
+ * guest memory where the guest can read them back, so they go through
+ * `firmware_images` like any other image and the firmware pulls the bytes
+ * once.
+ *
+ * This is a separate method because it has to run after every source of
+ * ROMs, not just before the first: `load_kernel` and `restore_state` both
+ * push into `option_roms` at different points.
+ */
+CPU.prototype.register_firmware_option_roms = function()
+{
+    if(!this.firmware_add_option_rom)
+    {
+        return;
+    }
+
+    for(var r = 0; r < this.option_roms.length; r++)
+    {
+        var rom = this.option_roms[r].data;
+        var handle = this.firmware_images.length;
+
+        this.firmware_images.push(rom);
+
+        if(this.firmware_add_option_rom(handle, rom.byteLength) < 0)
+        {
+            this.firmware_images.pop();
+            dbg_log("Firmware: option ROM " + this.option_roms[r].name + " rejected");
+        }
+        else
+        {
+            dbg_log("Firmware: option ROM " + this.option_roms[r].name +
+                " = " + rom.byteLength + " bytes, will run during POST");
+        }
+    }
 };
 
 /**

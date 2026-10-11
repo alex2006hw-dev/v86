@@ -210,6 +210,16 @@ pub trait Machine {
     /// The current real-mode stack pointer value, for diagnostics.
     fn peek_stack_pointer(&self) -> u32;
 
+    /// Push a 16-bit value onto the real-mode stack.
+    ///
+    /// This is the counterpart to [`Self::pop_stack_u16`], and it exists
+    /// because the one place the firmware needs to build a frame itself
+    /// is entering an option ROM: a far call has to leave a return
+    /// address for a ROM that honours one. Writing the caller's stack
+    /// from outside the CPU core cannot be done with the register
+    /// accessors, which do not reach memory below SP.
+    fn push_u16(&mut self, value: u16);
+
     /// Copy part of a host-owned image into `buf`.
     ///
     /// `image` identifies the image by the number the host gave it,
