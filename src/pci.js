@@ -247,7 +247,18 @@ PCI.prototype.set_state = function(state)
 
             if(value & 1)
             {
+                // Not every index is necessarily a bar: IDE reports four
+                // slots of which an absent channel leaves `undefined`,
+                // and virtio assigns its capabilities to the BAR the
+                // capability names. The other places that walk this array
+                // skip these, and restoring has to as well.
                 var bar = device.pci_bars[bar_nr];
+
+                if(!bar)
+                {
+                    continue;
+                }
+
                 var from = bar.original_bar & ~1 & 0xFFFF;
                 var to = value & ~1 & 0xFFFF;
                 this.set_io_bars(bar, from, to);
