@@ -1,0 +1,130 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Built-in firmware — browser boot test</title>
+
+<!--
+  Browser smoke test for the built-in (MIT) firmware.
+
+  This mirrors the SeaBIOS-era examples -- basic.html and friends boot
+  v86 with `bios: { url: ../bios/seabios.bin }` -- but with the built-in
+  firmware selected instead, so the page needs no ROM image at all. The
+  dropdown boots the same self-test sector against SeaBIOS and the Bochs
+  BIOS too, which makes a difference between the two rows a firmware
+  difference rather than a guest bug.
+
+  Serve the examples over HTTP (the emulator loads the wasm with fetch):
+
+      $ python -m http.server 8000
+      $ open http://localhost:8000/examples/firmware.html
+
+  The logic lives in firmware-browser.mjs so eslint reaches it.
+-->
+
+<link rel="stylesheet" href="../v86.css" />
+
+<style>
+  body
+  {
+      font: 14px/1.45 system-ui, sans-serif;
+      margin: 0;
+      padding: 24px;
+      background: #16161d;
+      color: #e4e4ec;
+  }
+
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p  { margin: 0 0 16px; max-width: 78ch; color: #b4b4c4; }
+  a  { color: #8ab4f8; }
+
+  #controls
+  {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+  }
+
+  #controls select, #controls button
+  {
+      font: inherit;
+      padding: 5px 10px;
+      border: 1px solid #3a3a48;
+      border-radius: 4px;
+      background: #22222c;
+      color: inherit;
+  }
+
+  #controls button { cursor: pointer; }
+  #controls button:hover { background: #2c2c38; }
+
+  #verdict
+  {
+      padding: 10px 14px;
+      border-radius: 4px;
+      border: 1px solid #3a3a48;
+      background: #22222c;
+      margin-bottom: 16px;
+      white-space: pre-wrap;
+  }
+
+  #verdict.pass { border-color: #2e7d32; background: #14311a; color: #a5d6a7; }
+  #verdict.fail { border-color: #c62828; background: #351414; color: #ef9a9a; }
+  #verdict.pending { color: #b4b4c4; }
+
+  #screen_container
+  {
+      display: inline-block;
+      padding: 12px;
+      border-radius: 4px;
+      background: #000;
+  }
+
+  #screen_container > div
+  {
+      color: #c8c8c8;
+  }
+
+  #details
+  {
+      margin-top: 16px;
+      padding: 12px 14px;
+      border-radius: 4px;
+      border: 1px solid #3a3a48;
+      background: #1b1b23;
+      white-space: pre-wrap;
+      font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      color: #a8a8b8;
+  }
+
+  #details:empty { display: none; }
+</style>
+
+<h1>Built-in firmware — browser boot test</h1>
+<p>
+  Boots a BIOS self-test boot sector, assembled in the page, on the
+  built-in firmware (MIT) so no ROM image is needed. The same sector can
+  be booted against SeaBIOS and the Bochs BIOS from
+  <code>bios/</code>, which is what the pre-firmware examples did. The
+  reference BIOSes must run with the JIT off (TechDebt JIT-1); the
+  built-in firmware runs with it on. See
+  <a href="firmware.html">examples/firmware.html</a> source and
+  <a href="../../docs/architecture.md">docs/architecture.md</a>.
+</p>
+
+<div id="controls">
+  <label for="firmware_choice">firmware:</label>
+  <select id="firmware_choice">
+    <option value="pcjs" selected>built-in (firmware: "pcjs")</option>
+    <option value="seabios">SeaBIOS + SeaVGABIOS (bios/)</option>
+    <option value="bochs">Bochs BIOS + Bochs VGABIOS (bios/)</option>
+  </select>
+  <button id="boot_button" type="button">Re-boot</button>
+</div>
+
+<div id="verdict" class="pending">booting …</div>
+
+<div id="screen_container"></div>
+
+<pre id="details"></pre>
+
+<script type="module" src="./firmware-browser.mjs"></script>

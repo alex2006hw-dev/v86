@@ -3,10 +3,9 @@
 Session log for the permissive-firmware work: what changed, why, and how
 each claim was checked. Companion documents: `README.md` (what the
 firmware is and how to use it), `TechDebt.md` (what it deliberately does
-not do), `todo.md` (the plan), and
-`docs/firmware-selection.md` (why we build ROMs rather than import one).
-`architecture.md`, covering how it all fits together, has not been
-written yet.
+not do), `todo.md` (the plan),
+`docs/firmware-selection.md` (why we build ROMs rather than import one),
+and `docs/architecture.md` (how it all fits together).
 
 Base commit: `8a9f739d` (`pcjs-v1`).
 
@@ -201,7 +200,7 @@ assumption, and only a different BIOS could expose it.
 | Check | Result |
 |---|---|
 | `cargo check` (host, and `--target wasm32-unknown-unknown`) | 0 errors, 0 warnings |
-| `cargo test -D warnings` (firmware crate) | **62 pass** (was 58) |
+| `cargo test -D warnings` (firmware crate) | **86 pass** (was 58) |
 | `node examples/firmware.js` (JIT) | **exit 0, `RESULT: PASS`** |
 | `node examples/firmware.js` (`FW_NO_JIT=1`) | **exit 0, `RESULT: PASS`** |
 | `node examples/firmware-oracle.js` (`FW_NO_JIT=1`) | SeaBIOS boots the same sector |
@@ -495,11 +494,189 @@ BOOT-2.
 | `examples/build-test-iso.mjs` | builds a 21-sector El Torito ISO around the self-test boot sector, giving the CD path a controlled subject with no ISO tooling installed |
 | `tools/httpfs-v86-server.py` | httpfs → plain HTTP, with `Range` |
 
-## 12. Not done
+## 13. Recent work
+
+### 13.1 E820 terminator fixed
+
+The E820 memory map could never end: resetting `EBX` to 0 made the
+exhaustion guard unreachable. Now `CF` is set, `AH=04h`, and `EBX` is
+untouched when the map is walked to its terminator. A test walks the
+map like a loader would.
+
+### 13.2 CD EDD reads verified byte-exact
+
+`examples/cd-read-check.mjs` reads 8192 bytes through the firmware's
+EDD path and compares them byte-for-byte against the same bytes read
+directly from the image. All 8192 match.
+
+### 13.3 Protected-mode reproducer
+
+A synthetic boot sector in `examples/firmware-selftest.mjs` enters
+protected mode, installs a GDT, clears PE, and returns to real mode.
+Seven bugs were in the test itself (GDT access byte offset, pseudo-descriptor
+overlap, LGDT/SGDT ModRM encoding, `and eax,imm8` encoding, far jump
+offsets, 0x66 prefix, CS:IP restoration). All fixed — the self-test passes
+end-to-end under both interpreter and JIT.
+
+### 13.4 LGDT probe
+
+`examples/lgdt-probe.mjs` — a 20-line boot sector proving `LGDT`/`SGDT`
+round-trip correctly. This refuted the earlier claim that v86 does not
+store the GDT; the bug was in the probe's own ModRM encoding.
+
+### 13.5 FreeNOS fault
+
+`examples/freenos-fault.mjs` boots FreeNOS under the firmware and catches
+the fault: `switch_seg → trigger_gp → call_interrupt_vector → panic`.
+Fault at `CS=8:EIP=0x5fe5` (byte `07` = `POP ES`). The thunk ping-pongs
+between `CS=8` (0x82ef) and `CS=0x18` (0x8369) — the protected-mode
+BIOS-call thunk. No IDT installed at that point → panic. This is BOOT-2.
+
+### 13.6 VM snapshot work
+
+- The vm front end now uses `firmware: "pcjs"` and `vga_memory_size: 8 MiB`.
+- `vm-boot-check.mjs` boots the warm-boot snapshot headless, watches serial.
+- Snapshot restore is sound: `CR0=0x80050033` (protected mode, paging on),
+  segment registers intact. Guest does not resume because the snapshot was
+  saved with CPU halted (`state[17] in_hlt = 1`). Filed as **VM-1**.
+- The 8 MiB VGA surface was a real bug: the snapshot saved with 8 MiB, the
+  page asked for 2 MiB → `offset is out of bounds`. Filed as **VM-2**.
+- `vm/` converted to a proper submodule (`git@github.com:alex-iphone/vm.git`).
+- `bios-seabios` branch created at `8f611b3` (SeaBIOS/VGABIOS); `main`
+  at `99c6a41` (new firmware). Both pushed to origin.
+
+### 13.6 Browser test case
+
+`examples/firmware.html` is the browser mirror of the SeaBIOS-era
+examples (`basic.html` and friends boot v86 with
+`bios: { url: "../bios/seabios.bin" }`). It boots the self-test boot
+sector, assembled in the page, on the built-in firmware — no ROM image
+fetched at all — and renders the emulated VGA screen.
+
+A dropdown also boots the same sector against SeaBIOS and the Bochs BIOS
+from `bios/`, so a difference between the rows is a firmware difference
+rather than a guest bug. The reference BIOSes run with `disable_jit: true`,
+carrying JIT-1 over from the Node side; the built-in firmware runs with
+the JIT on.
+
+`examples/firmware-browser-check.mjs` validates the page headlessly: that
+the ids the script reads match the ids the page defines (a typo throws
+only at boot time, in the browser), that the three selections are wired
+including the JIT switch, and that the page's configuration actually
+boots the self-test to `RESULT: PASS`. It cannot check the DOM and
+canvas half — the ScreenAdapter needs a 2d context — which is noted in
+its output rather than claimed as covered.
+
+### 13.7 Option ROM support (ROM-1 closed)
+
+This was the blocker for every path that boots a kernel, and it was the
+reason the vm guest could not cold boot at all.
+
+v86 boots a `bzimage` by building a 512-byte stub and pushing it into
+`cpu.option_roms`. `kernel.js` describes it plainly:
+
+> This rom will be executed by seabios after its initialisation
+
+The firmware built two images and ran neither of them from anywhere but
+their fixed places, so the stub was data in a buffer and the kernel never
+started. A cold boot of the vm guest ended at `cs:eip = f000:237` —
+inside the BIOS — with INT 19h the last service dispatched and 0 bytes on
+the serial line.
+
+`option_rom.rs` now runs every ROM the host registers:
+
+* validates `55 AA`, the length in 512-byte blocks, and the byte sum
+  over the declared length;
+* copies the image into `0xD0000`–`0xDFFFF`, back to back on its own
+  length, which is where a guest reading them back expects to find them;
+* enters it with a **far call**, so a ROM that returns resumes the
+  firmware instead of running off the end of its image. The return
+  address is a five-byte stub in the system ROM that far-jumps to the
+  INT 19h stub — everything POST has left to do is the bootstrap.
+
+The far call needs a `push_u16` on the `Machine` trait, which did not
+exist: the one place the firmware builds a frame itself is entering a
+ROM. `push_u16` is the counterpart to `pop_stack_u16` and writes back
+through the CPU's stack pointer, so a 32-bit stack is handled.
+
+Registered from `src/cpu.js` as a separate step, `register_firmware_option_roms()`,
+because it has to run *after* every source of ROMs: `load_kernel` pushes
+its stub during construction, and `restore_state` rebuilds them too.
+Registering inside `load_firmware` saw an empty list and ran nothing —
+the first bug, and the reason the first test after fixing it still
+failed.
+
+With that in place a cold boot of the vm guest reaches:
+`Decompressing Linux... Booting the kernel`, `cs=0x60` with a 32-bit
+`eip`, and 17 firmware traps with INT 10h the last service. That is
+further than a cold boot of this guest has ever gone, and it stops at
+exactly where `vm/state/v86state.bin.zst` was taken — see VM-3.
+
+### 13.8 A v86 restore bug found while testing
+
+`examples/vm-state-check.mjs` saves a running machine and restores it
+into a fresh one. Restoring died with
+
+```
+TypeError: Cannot read properties of undefined (reading 'original_bar')
+    at PCI.set_state
+```
+
+`pci_bars` is not densely indexed: `ide.js` leaves `undefined` in the
+slots of a channel that is not present, and `virtio.js` assigns
+`pci_bars[cap.bar]` for whatever BAR number the capability names.
+`set_state` walked `pci_bars.length` and indexed without checking, while
+the two other call sites in the same file already guarded with
+`if(!bar) continue;`. Fixed the same way. Filed as **V86-1**.
+
+### 13.9 The kernel blocker: E820 stopped at 64 MiB on a 128 MiB machine
+
+Written up in full under VM-3 in `TechDebt.md`. The short version, since
+it is the emulator bug the cold boot was actually hitting:
+
+* `Config::memory_kib` is the 16-bit BDA word at 0x413 — conventional
+  memory, which cannot describe more than 64 MiB. The E820 map was being
+  built from it.
+* A guest sizing its page tables from E820 therefore placed them where
+  the emulator had no memory, which is exactly what the boot showed:
+  writes to physical 0x35045FBC, ~880 MiB past the end of RAM.
+* `Config::total_memory_kib` is now separate and unclamped, and
+  `INT 15h AH=88h` / `AX=E801h` use it. The E801 code also had a unit
+  bug — `mem_kib - 640 * 1024` — that treated a KiB count as bytes.
+
+**Measured, not assumed.** With this in place the built-in firmware
+reaches the *identical* state SeaBIOS does: the same `cr3`, `cr4` and a
+page fault at the same `cr2`. The differential is the honest way to tell
+a firmware difference from an emulator one, and here it showed the
+firmware had caught up and the remainder is v86's.
+
+### 13.10 `vm-kernel-fault.mjs`: where the kernel stops
+
+The diagnostic that answered the above, rather than inferring it:
+
+* translates the guest's EIP through *its own* page tables, because a
+  kernel at `0xc0000000` with paging on has a linear EIP that is not an
+  address in the emulated RAM, and reading `mem8[eip]` gives nothing;
+* walks the CR registers and prints them by their hardware numbers,
+  because v86 stores them by slot (`cr[3]` is CR3, `cr[4]` is CR4) and
+  the obvious numbering is off by one;
+* logs the control registers as they change, because "CR3 was never
+  loaded" and "CR3 was loaded and then lost" look the same in a final
+  state dump;
+* dumps the IDT entry thunk the guest is stuck in, which is what turned
+  "it hangs after Booting the kernel" into "it is in an interrupt storm
+  in `irq_entries`".
+
+Three of those four were bugs in earlier versions of this script, not in
+the emulator, and each one changed the conclusion. Worth remembering
+before trusting a state dump.
+
+## 14. Not done
 
 Listed so nothing here reads as more finished than it is:
 
-- `architecture.md` is referenced by `TechDebt.md` but has not been written.
+- **No USB**, in the emulator or the BIOS, and no WebUSB mapping. USB-1
+  through USB-3.
 - **No USB**, in the emulator or the BIOS, and no WebUSB mapping. USB-1
   through USB-3.
 - **No loadable option-ROM infrastructure**, which USB-2 needs. ROM-1.

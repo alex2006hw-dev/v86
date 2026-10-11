@@ -4,10 +4,9 @@ Register of what the firmware deliberately does *not* do yet, why, and
 what it takes to close each item.
 
 Companion documents: `README.md` (what it is and how to use it),
-`Changes.md` (what this session changed), `todo.md` (the plan), and
-`docs/firmware-selection.md` (why we build ROMs instead of importing one).
-`architecture.md`, covering how it all fits together, has not been written
-yet.
+`Changes.md` (what this session changed), `todo.md` (the plan),
+`docs/firmware-selection.md` (why we build ROMs instead of importing one),
+and `docs/architecture.md` (how it all fits together).
 
 ## How to read this
 
@@ -33,7 +32,7 @@ that reports success to a Windows 95 installer is worse than an honest
 | **CD-3** | El Torito `terminate emulation` is a no-op | Stub | Medium |
 | **CD-4** | No ATAPI `IDENTIFY` (`INT 15h AX=4F06h`) | Absent | Medium |
 | **CD-5** | El Torito boot catalog not in the boot-config table | Absent | Low |
-| **ROM-1** | **No loadable option-ROM infrastructure** | Absent | **High** |
+| **ROM-1** | **No loadable option-ROM infrastructure** | **Done** — `option_rom.rs` runs ROMs the host registers | Closed |
 | **USB-1** | **No USB device emulation in v86 at all** | Absent | **High** |
 | **USB-2** | **No BIOS-side USB driver or mass-storage stack** | Absent | **High** |
 | **USB-3** | **No WebUSB host↔guest mapping** | Absent | **High** |
@@ -48,6 +47,10 @@ that reports success to a Windows 95 installer is worse than an honest
 | **BUILD-2** | `tests/firmware/` harness is stale and cannot run | Broken | High |
 | **BUILD-3** | Generated Rust sources are not committed | Absent | Low |
 | **JIT-1** | **SeaBIOS cannot boot under the v86 JIT** | Broken | Medium |
+| **VM-1** | **Snapshot does not resume execution** — saved with CPU halted; **not firmware-caused**, SeaBIOS restores the same dead state | Broken | Medium |
+| **VM-2** | **VGA surface size mismatch** — snapshot saved with 8 MiB, page asked for 2 MiB | Fixed | Low |
+| **VM-3** | **Guest kernel never starts**, under any BIOS; blocked on v86's IRQ delivery after the E820 fix below | Blocked | **High** |
+| **V86-1** | **`PCI.set_state` crashed restoring a machine with an absent IDE channel** | Fixed | Low |
 
 ---
 
@@ -130,24 +133,23 @@ the table never call `4D00h`.
 
 ## ROM infrastructure
 
-### ROM-1 — No loadable option-ROM infrastructure
+### ROM-1 — No loadable option-ROM infrastructure — **closed for boot ROMs**
 
-This is the item that most limits how CD-1/CD-2 and USB-2 will be
-built, so it is worth stating plainly.
+The part that mattered is now implemented, and it is what unblocked the
+cold-boot path. `option_rom.rs` runs every ROM the host registers:
+validates the header and checksum, copies the image into
+`0xD0000`–`0xDFFFF`, and enters it with a far call whose return address
+lands in the system ROM and jumps to the INT 19h stub. See
+`docs/architecture.md` §5.
 
-`rom.rs` builds exactly two images: a 64 KiB system ROM at `F000:0000`
-and a 32 KiB video option ROM at `C000:0000` (`rom.rs:49-56`). The
-system ROM is **0.3% full** — 168 non-fill bytes — because essentially
-all logic lives in Rust on the host and the ROM holds only a reset
-vector, a POST entry, and `push id; int 0x66; iret` stubs.
+That closes what a *boot* ROM needs, which is what v86's `bzimage` and
+`multiboot` paths are: both hand the firmware a 512-byte stub whose
+comment in `kernel.js` says "executed by seabios after its
+initialisation". Without a run, that stub is data in a buffer and the
+kernel never starts — which is exactly what a cold boot of the vm guest
+did before this, reaching `f000:237` with INT 19h the last service.
 
-That is a deliberate and comfortable position *for services the host
-can answer*. It stops being one the moment a driver has to be visible to
-the guest as guest code — a USB stack that Windows 95 pokes port by
-port, or a CD driver that responds to a hardware IRQ, must exist as real
-instructions in guest address space, not as a host call.
-
-The ROM builder can emit fixed code, but nothing supports:
+What is **still absent** is the part a *driver* ROM needs, unchanged:
 
 - `INT 15h AX=E800h` "install option ROM" / AX=E801h, AX=E802h
 - `INT 15h AX=D000h` "get system ROM map" (which drives `ES:DI`)
@@ -158,15 +160,35 @@ The ROM builder can emit fixed code, but nothing supports:
 - a relocation entry in the option-ROM header, needed as soon as a
   driver is not written to run at its link address
 
-**To finish:** add a ROM *registry* (kind, base, size, class code,
-payload source) that can hold a third "loadable" image, an
-`INT 15h AX=E800h` implementation that copies it to the caller's
-CS:0000, fixes up the checksum and relocations, and installs its INT
-handler; and a slot in the config table for the ROM map.
-
 **Done when:** a driver written as ordinary 16-bit assembly can be
 dropped into the tree, is loaded by a real guest on demand, and is
 reported in the AH=C0h ROM map.
+
+### V86-1 — `PCI.set_state` crashed on a machine with no IDE channel
+
+Found by the VM state check (`examples/vm-state-check.mjs`), which saves
+a running machine and restores it into a fresh one. Restoring died with
+
+```
+TypeError: Cannot read properties of undefined (reading 'original_bar')
+    at PCI.set_state
+```
+
+`pci_bars` is not densely indexed. `ide.js` builds five slots and puts
+`undefined` in the ones whose channel is absent, and `virtio.js` assigns
+`pci_bars[cap.bar]` for whatever BAR number the capability names, so a
+gap is possible there too. `set_state` walked `pci_bars.length` and
+indexed without checking, while the two other call sites in the same file
+already did `if(!bar) continue;`.
+
+Fixed by giving `set_state` the same guard. It only reproduces when a
+device is present but a channel is not — a floppy-only machine, or one
+with no secondary IDE channel — which is why it had not come up.
+
+**To close:** nothing; the guard is the whole fix. What is missing is a
+test that restores into a machine whose device list differs from the one
+that saved, which is the only way to reach the sparse case.
+
 
 ---
 
@@ -788,3 +810,99 @@ Recorded so these are not re-litigated:
 - **Thin ROMs.** A 168-byte system ROM is the design, not an oversight:
   leaf services live on the host. It only becomes debt at ROM-1, and
   that is recorded there.
+
+## VM validation
+
+The `vm/` front end is a submodule (`git@github.com:alex-iphone/vm.git`).
+It is headless: no VGA surface, every byte the guest prints arrives on
+COM1. `examples/vm-boot-check.mjs` boots its warm-boot snapshot with
+the built-in firmware and watches the serial line.
+
+### VM-1 — The snapshot does not resume execution
+
+`vm/state/v86state.bin.zst` was saved with the CPU **halted**
+(`state[17] in_hlt = 1`). Restoring it leaves the guest halted with
+nothing to wake it:
+
+```
+  cs:eip = 0x60:-3ab79315 (constant)
+  total bytes on serial: 0
+```
+
+The restore itself is sound. `CR0` comes back as `0x80050033`
+(protected mode, paging on) and the segment registers are intact.
+`state[17]` is the halted flag and `state[4]` is `protected_mode`;
+the snapshot carries `in_hlt=1` with `protected_mode=1`, and the
+restore preserves both.
+
+**This is not caused by the BIOS replacement, and that was measured
+rather than assumed.** Restoring the same snapshot against the real
+SeaBIOS pair from `vm/bios/` produces the *identical* state: the same
+`cs:eip`, the same blank serial line, the same VGA screen. The snapshot
+carries no state a BIOS could continue from — the guest had not started
+its kernel. Its VGA screen ends at the kernel decompressor's last line,
+"Booting the kernel", which is where a cold boot stops too (below).
+
+**Two further findings while establishing this:**
+
+* The restore only reaches the 9p device at all if `filesystem` is
+  configured. Without it the PCI device 0x30 the snapshot expects is
+  missing, the guest's mount blocks, and nothing ever prints.
+  `examples/vm-boot-check.mjs` originally omitted it; `vm/index.html`
+  has always supplied it on the restore path.
+* A restore into a *fresh* emulator needs the `PCI.set_state` guard in
+  V86-1 above to get any further at all.
+
+**Done when:** the snapshot resumes, or the guest is booted from source
+and re-saved at a point where it can continue.
+
+### VM-3 — The guest kernel does not start under any BIOS
+
+A cold boot of the vm guest (`?boot=true`) runs the option ROM, the
+kernel decompresses, and its last line "Booting the kernel" appears. It
+then stops — the same point the snapshot was taken at, under SeaBIOS as
+well as under the built-in firmware. `examples/vm-kernel-fault.mjs` now
+says *where* rather than only that.
+
+**Fixed: the E820 map stopped at 64 MiB on a 128 MiB machine.**
+`Config::memory_kib` is the 16-bit BDA word at 0x413, which holds
+conventional memory and cannot describe more than 64 MiB. The E820 map was
+built from it, so a kernel sizing its page tables from E820 placed them
+where the emulator had no memory — exactly what the boot showed: writes
+to physical 0x35045FBC, ~880 MiB past the end of RAM. `Config::
+total_memory_kib` is now separate and unclamped, and `INT 15h AH=88h` /
+`AX=E801h` use it too; the latter also had a unit bug, treating a KiB
+count as bytes.
+
+With that, the built-in firmware reaches **exactly** the state SeaBIOS
+does: the same `cr3`, the same `cr4` written, and the same page fault at
+`cr2=0xffd39000`.
+
+**Still failing, for both BIOSes:** the guest faults at virtual
+`0xffd39000` and then loops. The instruction pointer settles inside the
+IDT entry thunks — `push 0x30; jmp common_interrupt`, `push 0x31; …` —
+which is Linux's `irq_entries` table. An EIP frozen there while the guest
+takes interrupts repeatedly is an interrupt storm rather than a hang: the
+handler starts and never returns. That is v86's PIC/APIC delivery
+(`src/io.js`; the README already lists "Partial APIC support"), and both
+firmwares reach it identically, so it is not a firmware difference.
+
+Note for anyone reading the screen: the VGA text buffer holds whatever
+early boot last wrote, and the kernel switches away from it early, so it
+still says "Booting the kernel" long after the guest has moved on. It is
+not a progress signal.
+
+**Done when:** the guest reaches a login prompt on either firmware. The
+next thing to look at is v86's IRQ delivery to a guest that has
+installed its own IDT.
+
+
+### VM-2 — The snapshot needs an 8 MiB VGA surface
+
+The snapshot was saved with an 8 MiB VGA surface; the page asked for
+2 MiB, so `VGAScreen.set_state` threw `offset is out of bounds` on
+the SVGA memory copy. Both `vm/index.html` and the check now ask for
+8 MiB.
+
+**Done when:** the recorded size matches the snapshot, so the
+check passes without an override.

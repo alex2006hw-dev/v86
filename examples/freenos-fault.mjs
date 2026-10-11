@@ -84,11 +84,11 @@ process.on("uncaughtException", (e) =>
     // masking to 16 bits names the wrong address.
     const sp = c.reg32[4] >>> 0;
     const ss = c.sreg[2];
-    const ssBase = c.segment_offsets ? (c.segment_offsets[2] >>> 0) : (ss << 4);
+    const ss_base = c.segment_offsets ? (c.segment_offsets[2] >>> 0) : (ss << 4);
     let stack = "";
     for(let i = 0; i < 10; i++)
     {
-        const a = (ssBase + sp + i * 2) >>> 0;
+        const a = (ss_base + sp + i * 2) >>> 0;
         const w = (mem[a] | (mem[a + 1] << 8)) & 0xFFFF;
         stack += a.toString(16) + ":" + w.toString(16).padStart(4, "0") + " ";
     }

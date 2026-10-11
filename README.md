@@ -134,11 +134,16 @@ and NetBSD's installers do not complete boot under either BIOS (BOOT-1).
 
 Worth reading before relying on it:
 
-- **No `INT 13h AX=4B00h/4B02h`**, so a loader cannot boot from CD after POST
-  has run; only POST's own CD boot works.
 - **No loadable option ROMs**, so a driver cannot be guest-visible code.
+  Boot ROMs *are* run — `bzimage` and `multiboot` cold-boot — but the
+  `INT 15h AX=E800h`/`D000h`/`4F08h` services a guest driver needs are not
+  implemented.
 - **No USB**, in the emulator or the BIOS.
 - **No PCI BIOS, APIC or ACPI tables.**
+- **The `vm/` guest never reaches userspace.** Its kernel boots past the
+  decompressor and then stops, under this firmware and under SeaBIOS
+  alike, which is why nothing has yet updated postgres inside it.
+  VM-3 in [`TechDebt.md`](TechDebt.md).
 
 [`TechDebt.md`](TechDebt.md) is the full register, with file references.
 
@@ -175,6 +180,7 @@ Worth reading before relying on it:
 
 [How it works](docs/how-it-works.md) —
 **Firmware selection** ([docs/firmware-selection.md](docs/firmware-selection.md)) —
+**Architecture** ([docs/architecture.md](docs/architecture.md)) —
 **Changes** ([Changes.md](Changes.md)) —
 **Tech debt** ([TechDebt.md](TechDebt.md)) —
 [Networking](docs/networking.md) —
@@ -271,7 +277,7 @@ See [tests/Readme.md](tests/Readme.md) for more information.
 The firmware has its own tests, none of which need a disk image:
 
 ```console
-$ make firmware-unit-test      # 62 host-side tests, no wasm toolchain needed
+$ make firmware-unit-test      # 86 host-side tests, no wasm toolchain needed
 $ node examples/firmware.js    # end-to-end boot test; exit 0 on success
 ```
 
@@ -319,8 +325,9 @@ var emulator = new V86({
 
 ### Firmware examples
 
-Four Node scripts, all runnable in a clean checkout with no disk images.
-`FW_ORACLE=seabios` switches the last two to a real BIOS from `bios/`.
+Six Node scripts and one browser page, all runnable in a clean checkout
+with no disk images. `FW_ORACLE=seabios` switches the last two to a real
+BIOS from `bios/`.
 
 | Script | What it does |
 |---|---|
@@ -329,7 +336,11 @@ Four Node scripts, all runnable in a clean checkout with no disk images.
 | [`firmware-oracle.js`](examples/firmware-oracle.js) | Boots the same boot sector against SeaBIOS or Bochs, so a difference between the two runs is a firmware difference rather than a guest bug. Needs `FW_NO_JIT=1`. Divergence is expected and explained on stderr — see below. |
 | [`firmware-service-probe.mjs`](examples/firmware-service-probe.mjs) | Calls one service, records the registers a BIOS returns, and prints them. Settles a disagreement about a specification by measurement. Needs `FW_NO_JIT=1` against a real BIOS. |
 | [`cd-boot.js`](examples/cd-boot.js) | Boots a disk or CD image, reporting which structures it found first so a failure says which path was expected. |
+| [`vm-coldboot.mjs`](examples/vm-coldboot.mjs) | Cold-boots the `vm/` guest from its bzimage, and reports how far the kernel got. Needs `vm/` served over HTTP. |
+| [`vm-state-check.mjs`](examples/vm-state-check.mjs) | Validates that a change to VM state survives `save_state` → `restore_state`, with the JIT on and off. |
 | [`build-test-iso.mjs`](examples/build-test-iso.mjs) | Builds a 21-sector El Torito ISO around the self-test boot sector, giving the CD path a controlled subject. |
+| [`firmware.html`](examples/firmware.html) | The same thing in a browser: boots the self-test on the built-in firmware, and can boot the same sector against SeaBIOS and the Bochs BIOS for comparison. Serve `examples/` over HTTP and open it. |
+| [`firmware-browser-check.mjs`](examples/firmware-browser-check.mjs) | Checks the page's wiring and its boot configuration without a browser. `node examples/firmware-browser-check.mjs` |
 
 ```console
 $ node examples/build-test-iso.mjs test-boot.iso

@@ -19,7 +19,16 @@ import { V86 } from "../build/libv86.mjs";
 
 const SECONDS = Number(process.argv[2] || 30);
 const ROOT = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "..");
-const STATE = path.join(ROOT, "vm/state/v86state.bin.zst");
+// The firmware and the snapshot live in the vm submodule, so
+// this check exercises exactly what the page ships.
+const VM = path.join(ROOT, "vm");
+const STATE = path.join(VM, "state/v86state.bin.zst");
+// The page always configures the 9p filesystem, including on the
+// restore path, and the snapshot was taken mid-9p-transaction: without
+// it the PCI device 0x30 the snapshot expects is missing and the guest
+// blocks waiting for a reply that can never come. It has to be served,
+// because `baseurl` is fetched rather than read from disk.
+const VM_URL = process.env.VM_URL || "http://127.0.0.1:8123";
 
 if(!fs.existsSync(STATE))
 {
@@ -34,7 +43,7 @@ const raw = execFileSync("zstd", ["-dc", STATE], { maxBuffer: 256 * 1024 * 1024 
 console.log("snapshot: " + (raw.length / 1048576).toFixed(1) + " MiB, decompressed");
 
 const emulator = new V86({
-    wasm_path: path.join(ROOT, "build/v86.wasm"),
+    wasm_path: path.join(VM, "lib/v86.wasm"),
     memory_size: 128 * 1024 * 1024,
     // The snapshot was saved with a larger VGA surface than
     // the 2 MiB this front end asks for, so the size is
@@ -44,6 +53,11 @@ const emulator = new V86({
     firmware: "pcjs",
     bios: undefined,
     vga_bios: undefined,
+    // Exactly what index.html's restore path configures.
+    filesystem: {
+        basefs: VM_URL + "/filesystem/filesystem.json",
+        baseurl: VM_URL + "/filesystem/",
+    },
     initial_state: { buffer: raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) },
     autostart: true,
     disable_keyboard: true,
